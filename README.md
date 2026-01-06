@@ -1,0 +1,32 @@
+PPF Manager
+============
+
+ES
+
+Herramienta para crear y aplicar parches PPF en Windows.
+Basado en las fuentes PPF3 de Icarus/Paradox, para que sea compatible con parches antiguos
+
+Cambios relevantes:
+- Añadido soporte para imagenes .iso
+- Interfaz gráfica para crear y aplicar los parches fácilmente, también se puede usar en modo consola.
+- Soporte completo para UTF-8/ANSI según convenga, textos y archivo .diz salen legibles.
+- Creación de parches: escribe en archivo temporal y sólo renombra si termina bien (evita parches corruptos).
+- Archivo .diz se limita a 3 KB para no romper el parche.
+- Gestión y limpieza de errores mejorada y más robusta.
+- Corregidos errores menores que podían causar conflictos.
+
+____________________________________
+
+EN
+
+Tool for creating and applying PPF patches on Windows.
+Based on the Icarus/Paradox PPF3 source code, to make it compatible with older patches
+
+Key changes:
+- Added support for .iso images
+- Graphical interface for easy patch creation and application; console mode is also available.
+- Full support for UTF-8/ANSI as needed; text and .id file are displayed legibly.
+- Patch creation: writes to a temporary file and only renames if successful (prevents corrupted patches).
+- .diz file is limited to 3 KB to avoid breaking the patch.
+- Improved and more robust error handling and cleanup.
+- Minor errors that could cause conflicts have been corrected.

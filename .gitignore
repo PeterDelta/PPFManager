@@ -1,0 +1,24 @@
+# Build outputs
+*.exe
+*.dll
+*.lib
+*.obj
+*.res
+*.pdb
+*.ilk
+*.log
+*.bat
+
+# IDE/user state
+*.user
+*.suo
+*.tmp
+*.bak
+*.swp
+~$*
+.DS_Store
+Thumbs.db
+tests/logs
+tests/work_cmp
+Comandos.txt
+.clang-format
