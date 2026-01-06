@@ -1,0 +1,31 @@
+# Build outputs
+*.exe
+*.dll
+*.lib
+*.obj
+*.o
+*.res
+*.pdb
+*.ilk
+*.log
+*.rc
+*.bat
+*.ico
+.manifest
+
+# Resource/object artifacts
+PPFManager_res.o
+
+# IDE/user state
+*.user
+*.suo
+*.tmp
+*.bak
+*.swp
+~$*
+
+# macOS/Windows detritus
+.DS_Store
+Thumbs.db
+PPFManager.manifest
+*.txt
