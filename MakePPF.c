@@ -22,8 +22,6 @@
 #include <windows.h>
 #include <errno.h>
 
-
-//////////////////////////////////////////////////////////////////////
 // Used global variables.
 #ifdef BUILD_STANDALONE
 int ppf=0, bin=0, mod=0, fileid=0;
@@ -43,7 +41,8 @@ unsigned char *x, *y;
 typedef struct Arg
 {
 	int  undo;
-	int  blockcheck;
+	int  blockcheck;      /* 1 = validation enabled, 0 = disabled */
+	int  blockcheck_set;  /* 1 = user explicitly set validation (via -x), 0 = not specified */
 	int  imagetype;
 	int  desc;
 	int  fileid;
@@ -55,7 +54,6 @@ typedef struct Arg
 }Argumentblock;
 Argumentblock Arg;
 
-//////////////////////////////////////////////////////////////////////
 // Used prototypes.
 int		OpenFilesForCreate(void);
 int		PPFCreateHeader(void);
@@ -164,37 +162,34 @@ static void PrintRawTextBytes(const unsigned char *s) {
 
 
 #ifdef BUILD_STANDALONE
-//////////////////////////////////////////////////////////////////////
 // Main routine (standalone build only).
 int main(int argc, char **argv)
 #else
-//////////////////////////////////////////////////////////////////////
 // Main routine (integrated build).
 int MakePPF_Main(int argc, char **argv)
 #endif
 {
-	printf("MakePPF v3.0 by =Icarus/Paradox= %s\n", __DATE__);
 	if(argc==1){
-		printf("Usage: PPF <command> [-<sw> [-<sw>...]] <original bin> <modified bin> <ppf>\n");
+		printf("Usage: PPFManager.exe c [Command] <original bin> <modified bin> <ppf>\n");
 		printf("<Commands>\n");
-		printf("  c : create PPF3.0 patch            a : add file_id.diz\n");
-		printf("  s : show patchinfomation\n");
+		printf("  c : create PPF3.0 patch            f : add file_id.diz\n");
+		printf("  s : show patch infomation\n");
 		printf("<Switches>\n");
-		printf(" -u        : include undo data (default=off)\n");
-		printf(" -x        : disable patchvalidation (default=off)\n");
-		printf(" -i [0/1]  : imagetype, 0 = BIN, 1 = GI (default=bin)\n");
-		printf(" -d \"text\" : use \"text\" as description\n");
-		printf(" -f \"file\" : add \"file\" as file_id.diz\n");
+		printf(" -u : include undo data (default=off)\n");
+		printf(" -x : disable patchvalidation (default=off)\n");
+		printf(" -i : imagetype, 0 = BIN, 1 = GI, 2 = ISO (default=bin)\n");
+		printf(" -d : \"write description\"\n");
+		printf(" -f : \"file_id.diz\" to insert the file into the patch\n");
 
-		printf("\nExamples: PPF c -u -i 1 -d \"my elite patch\" game.bin patch.bin output.ppf\n");
-		printf("          PPF a patch.ppf myfileid.txt\n");
+		printf("\nExamples: PPF c -u -i 0 -d \"my patch\" game.bin mod.bin output.ppf\n");
+		printf("          PPF f patch.ppf myfileid.diz\n");
 		return(0);
 	}
 
-	//////////////////////////////////////////////////////////////////////
 	// Setting defaults.
 	Arg.undo=0;
 	Arg.blockcheck=1;
+	Arg.blockcheck_set=0;
 	Arg.imagetype=0;
 	Arg.fileid=0;
 	Arg.desc=0;
@@ -232,7 +227,7 @@ int MakePPF_Main(int argc, char **argv)
 						PPFShowPatchInfo();
 						_close(ppf);
 						break;
-		case 'a':		
+		case 'f':		
 						if(argc<4){
 							printf("Error: need more input for command '%s'\n",argv[1]);
 							break;
@@ -272,7 +267,6 @@ int MakePPF_Main(int argc, char **argv)
 
 }
 
-//////////////////////////////////////////////////////////////////////
 // Start to create the patch.
 void PPFCreatePatch(void){
 
@@ -286,7 +280,6 @@ void PPFCreatePatch(void){
 	return;
 }
 
-//////////////////////////////////////////////////////////////////////
 // Create PPF3.0 Header.
 // Return: 1 - Failed
 // Return: 0 - Success
@@ -314,10 +307,14 @@ int PPFCreateHeader(void){
 	if((_write(ppf, &dummy, 1)) == -1 ) return(1);
 
 	if(Arg.blockcheck){
-		if(Arg.imagetype){
-			_lseeki64(bin,0x80A0,SEEK_SET);
+		/* imagetype: 0=BIN, 1=GI, 2=ISO */
+		if(Arg.imagetype == 1){
+			_lseeki64(bin, 0x80A0, SEEK_SET); /* GI */
+		} else if(Arg.imagetype == 2) {
+			_lseeki64(bin, 0x8000, SEEK_SET); /* ISO9660 Primary Volume Descriptor at sector 16*2048 */
+			/* Validation is disabled for ISO by default (user can enable if desired) */
 		} else {
-			_lseeki64(bin,0x9320,SEEK_SET);
+			_lseeki64(bin, 0x9320, SEEK_SET); /* BIN */
 		}
 		_read(bin,&binblock,1024);
 		if((_write(ppf, &binblock, 1024)) == -1 ) return(1);
@@ -327,8 +324,6 @@ int PPFCreateHeader(void){
 	return(0);
 }
 
-
-//////////////////////////////////////////////////////////////////////
 // Part of the PPF3.0 algorythm to find file-changes. Please note that
 // 16 MegaBit is needed for the engine. Allocated by malloc();
 // Return: 1 - Failed
@@ -382,9 +377,7 @@ int PPFGetChanges(void){
 	return(0);
 }
 
-//////////////////////////////////////////////////////////////////////
-// This function actually scans the 8 Mbit blocks and writes down the
-// patchdata.
+// This function actually scans the 8 Mbit blocks and writes down the patchdata
 // Return: Found differences.
 int WriteChanges(int amount, __int64 chunk){
 	int found=0;
@@ -410,8 +403,6 @@ int WriteChanges(int amount, __int64 chunk){
 	return(found);
 }
 
-
-//////////////////////////////////////////////////////////////////////
 // Check all switches given in commandline and fill Arg structure.
 // Return: 0 - Failed
 // Return: 1 - Success
@@ -432,7 +423,7 @@ int OpenFilesForCreate(void){
 
 	//Check if files have same size.
 	if((_filelengthi64(bin)) != (_filelengthi64(mod))){
-		printf("Error: bin files are different in size.");
+		printf("Error: input files are different in size.\n");
 		CloseAllFiles();
 		return(0);
 	}
@@ -475,7 +466,6 @@ int OpenFilesForCreate(void){
 	return(1);
 }
 
-//////////////////////////////////////////////////////////////////////
 // Closing all files which are currently opened.
 void CloseAllFiles(void){
 	if(ppf>0) _close(ppf);
@@ -504,7 +494,6 @@ void CloseAllFiles(void){
 	if(fileid>0) _close(fileid);
 }
 
-//////////////////////////////////////////////////////////////////////
 // Check if a file_id.diz is available.
 // Return: 0 - No file_id.diz
 // Return: 1 - Yes.
@@ -519,7 +508,6 @@ int CheckIfFileId(){
 	return(0);
 }
 
-//////////////////////////////////////////////////////////////////////
 // Check if a file is a PPF3.0 Patch.
 // Return: 0 - No PPF3.0
 // Return: 1 - PPF3.0
@@ -534,7 +522,6 @@ int CheckIfPPF3(){
 	return(0);
 }
 
-//////////////////////////////////////////////////////////////////////
 // Show various patch information. (PPF3.0 Only)
 void PPFShowPatchInfo(void){
 	unsigned char x, desc[51], id[3072];
@@ -546,10 +533,14 @@ void PPFShowPatchInfo(void){
 	_lseeki64(ppf,56,SEEK_SET);
 	_read(ppf, &x, 1);
 	printf("Imagetype   : ");
-	if(!x){
+	if(x == 0){
 		printf("BIN\n");
-	} else {
+	} else if(x == 1){
 		printf("GI\n");
+	} else if(x == 2){
+		printf("ISO\n");
+	} else {
+		printf("Unknown (%d)\n", x);
 	}
 
 	_lseeki64(ppf,57,SEEK_SET);
@@ -593,7 +584,6 @@ void PPFShowPatchInfo(void){
 	}	
 }
 
-//////////////////////////////////////////////////////////////////////
 // This routine adds a file_id.diz to a PPF3.0 patch.
 // Return: 0 - Okay
 // Return: 1 - Failed.
@@ -620,7 +610,6 @@ int PPFAddFileId(void){
 	return(0);
 }
 
-//////////////////////////////////////////////////////////////////////
 // Check all switches given in commandline and fill Arg structure.
 void CheckSwitches(int argc, char **argv){
 	int i;
@@ -632,9 +621,10 @@ void CheckSwitches(int argc, char **argv){
 		
 			switch(x[1]){
 				case 'u'	:	Arg.undo=1; break;
-				case 'x'	:	Arg.blockcheck=0; break;
+			case 'x'	: 	Arg.blockcheck=0; Arg.blockcheck_set=1; break;
 				case 'i'	:	if(*argv[i+1]=='0') Arg.imagetype=0;
-								if(*argv[i+1]=='1') Arg.imagetype=1;
+						else if(*argv[i+1]=='1') Arg.imagetype=1;
+						else if(*argv[i+1]=='2') Arg.imagetype=2;
 								i++;
 								break;
 				case 'd'	:	Arg.desc=1; Arg.description=argv[i+1];
@@ -647,6 +637,10 @@ void CheckSwitches(int argc, char **argv){
 			}
 
 		}
+	}
+	/* If imagetype is ISO and user did not explicitly set validation (-x), disable validation by default. */
+	if (Arg.imagetype == 2 && Arg.blockcheck_set == 0) {
+		Arg.blockcheck = 0;
 	}
 	Arg.ppfname=argv[argc-1];
 	Arg.modname=argv[argc-2];

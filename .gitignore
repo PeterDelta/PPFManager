@@ -29,3 +29,5 @@ PPFManager_res.o
 Thumbs.db
 PPFManager.manifest
 *.txt
+file_id.diz
+*.ppf

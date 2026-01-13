@@ -22,8 +22,6 @@
 #include <windows.h>
 #include <locale.h>
 
-
-//////////////////////////////////////////////////////////////////////
 // Used global variables.
 #ifdef BUILD_STANDALONE
 int ppf, bin;
@@ -37,7 +35,6 @@ extern unsigned char ppfmem[512];
 #define APPLY 1
 #define UNDO 2
 
-//////////////////////////////////////////////////////////////////////
 // Used prototypes.
 int		OpenFiles(char* file1, char* file2);
 int		PPFVersion(int ppf);
@@ -138,14 +135,13 @@ int main(int argc, char **argv)
 int ApplyPPF_Main(int argc, char **argv)
 #endif
 {
-	printf("ApplyPPF v3.0 by =Icarus/Paradox= %s\n", __DATE__);
 	if(argc!=4){
-		printf("Usage: ApplyPPF <command> <binfile> <patchfile>\n");
+		printf("Usage: PPFManager.exe <command> <binfile> <patchfile>\n");
 		printf("<Commands>\n");
 		printf("  a : apply PPF1/2/3 patch\n");
 		printf("  u : undo patch (PPF3 only)\n");
 
-		printf("\nExample: ApplyPPF.exe a game.bin patch.ppf\n");
+		printf("\nExample: PPFManager.exe a game.bin patch.ppf\n");
 		return(0);
 	}
 
@@ -181,7 +177,6 @@ int ApplyPPF_Main(int argc, char **argv)
 	return(0);
 }
 
-//////////////////////////////////////////////////////////////////////
 // Applies a PPF1.0 patch.
 void ApplyPPF1Patch(int ppf, int bin){
 	char desc[51];
@@ -218,7 +213,6 @@ void ApplyPPF1Patch(int ppf, int bin){
 
 }
 
-//////////////////////////////////////////////////////////////////////
 // Applies a PPF2.0 patch.
 void ApplyPPF2Patch(int ppf, int bin){
 		char desc[51], in;
@@ -285,7 +279,6 @@ void ApplyPPF2Patch(int ppf, int bin){
 	printf(" 100.00 %%\n");
 	printf("successful.\n");
 }
-//////////////////////////////////////////////////////////////////////
 // Applies a PPF3.0 patch.
 void ApplyPPF3Patch(int ppf, int bin, char mode){
 	unsigned char desc[51], imagetype=0, undo=0, blockcheck=0, in;
@@ -322,10 +315,13 @@ void ApplyPPF3Patch(int ppf, int bin, char mode){
 		_lseeki64(ppf, 60, SEEK_SET);
 		_read(ppf, &ppfblock, 1024);
 
-		if(imagetype){
-			_lseeki64(bin, 0x80A0, SEEK_SET);
+		/* imagetype: 0=BIN, 1=GI, 2=ISO */
+		if(imagetype == 1){
+			_lseeki64(bin, 0x80A0, SEEK_SET); /* GI */
+		} else if(imagetype == 2){
+			_lseeki64(bin, 0x8000, SEEK_SET); /* ISO9660 PVD */
 		} else {
-			_lseeki64(bin, 0x9320, SEEK_SET);
+			_lseeki64(bin, 0x9320, SEEK_SET); /* BIN */
 		}
 		_read(bin, &binblock, 1024);
 		in=memcmp(ppfblock, binblock, 1024);
@@ -383,8 +379,6 @@ void ApplyPPF3Patch(int ppf, int bin, char mode){
 
 }
 
-
-//////////////////////////////////////////////////////////////////////
 // Shows File_Id.diz of a PPF2.0 / PPF3.0 patch.
 // Input: 2 = PPF2.0
 // Input: 3 = PPF3.0
@@ -422,7 +416,6 @@ int ShowFileId(int ppf, int ppfver){
 	return orglen;
 }
 
-//////////////////////////////////////////////////////////////////////
 // Check what PPF version we have.
 // Return: 0 - File is no PPF.
 // Return: 1 - File is a PPF1.0
@@ -440,8 +433,6 @@ int PPFVersion(int ppf){
 	return(0);
 }
 
-
-//////////////////////////////////////////////////////////////////////
 // Open all needed files.
 // Return: 0 - Successful
 // Return: 1 - Failed.
