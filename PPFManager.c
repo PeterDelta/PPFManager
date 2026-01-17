@@ -1,3 +1,4 @@
+#define _WIN32_WINNT 0x0A00
 #include <windows.h>
 #include <commctrl.h>
 #include <commdlg.h>
@@ -21,8 +22,9 @@
 #include <objbase.h>
 #include <shlobj.h>
 #include <shobjidl.h>
+#include <shellapi.h>
 
-/* Set PPFMANAGER_DEBUG to 1 to enable developer debug logging (writes translate_debug.txt) */
+// Establecer PPFMANAGER_DEBUG a 1 para habilitar registro de depuración (escribe translate_debug.txt)
 #ifndef PPFMANAGER_DEBUG
 #define PPFMANAGER_DEBUG 0
 #endif
@@ -40,11 +42,18 @@ static void DebugLogTranslate(const wchar_t *orig, const wchar_t *out) {
 static inline void DebugLogTranslate(const wchar_t *orig, const wchar_t *out) { (void)orig; (void)out; }
 #endif
 
-/* Global icon handles (managed by LoadAndSetIconsForDPI) */
+// Manejadores de iconos globales (gestionados por LoadAndSetIconsForDPI)
 static HICON g_hIconBig = NULL;
 static HICON g_hIconSmall = NULL;
 
-/* Get system DPI (use GetDpiForSystem when available) */
+// IDs para controles personalizados
+#ifndef ID_ABOUT_LINK
+#define ID_ABOUT_LINK 4001
+#endif
+
+// Soporte de mapeo de memoria eliminado; no hay estado global de mapa.
+
+// Obtener DPI del sistema (usar GetDpiForSystem cuando esté disponible) 
 static int GetSystemDPI(void) {
     typedef UINT (WINAPI *GetDpiForSystem_t)(void);
     GetDpiForSystem_t pGetDpiForSystem = (GetDpiForSystem_t)GetProcAddress(GetModuleHandleW(L"user32"), "GetDpiForSystem");
@@ -55,36 +64,50 @@ static int GetSystemDPI(void) {
     return dpi;
 }
 
-/* Get DPI for a window if available, fallback to device caps */
+// Obtener DPI para una ventana si está disponible; alternativa: métricas del dispositivo
 static int GetWindowDPI(HWND hwnd) {
     typedef UINT (WINAPI *GetDpiForWindow_t)(HWND);
     GetDpiForWindow_t pGetDpiForWindow = (GetDpiForWindow_t)GetProcAddress(GetModuleHandleW(L"user32"), "GetDpiForWindow");
     if (pGetDpiForWindow) return (int)pGetDpiForWindow(hwnd);
-    // Fallback to system metrics
+    // Alternativa: usar métricas del sistema
     HDC hdc = GetDC(hwnd);
     int dpi = 96;
     if (hdc) { dpi = GetDeviceCaps(hdc, LOGPIXELSX); ReleaseDC(hwnd, hdc); }
     return dpi;
 }
 
-/* Scale a base pixel value (assumed at 96 DPI) for the given window's DPI */
+// Escalar un valor de píxeles base (asumido a 96 DPI) para el DPI de la ventana
 static int ScaleForWindow(HWND hwnd, int basePx) {
     int dpi = GetWindowDPI(hwnd);
     return MulDiv(basePx, dpi, 96);
 }
 
-/* Wrapper for GetSystemMetricsForDpi when available */
-static int GetSystemMetricsForDpiSafe(int index, UINT dpi) {
-    typedef int (WINAPI *GetSystemMetricsForDpi_t)(int, UINT);
-    GetSystemMetricsForDpi_t pGetSystemMetricsForDpi = (GetSystemMetricsForDpi_t)GetProcAddress(GetModuleHandleW(L"user32"), "GetSystemMetricsForDpi");
-    if (pGetSystemMetricsForDpi) return pGetSystemMetricsForDpi(index, dpi);
-    return GetSystemMetrics(index);
-}
-
-/* Forward declaration for font enum helper */
+// Envoltorio para GetSystemMetricsForDpi cuando esté disponible
+// Declaración adelantada para el ayudante de enumeración de fuentes
 static BOOL CALLBACK SetFontEnumProc(HWND hwndChild, LPARAM lParam);
 
-/* Load icon using LoadIconWithScaleDown if available (preserves alpha when scaling down) */
+// Intentar cargar un icono desde el directorio resources/ si está presente
+static BOOL TryLoadIconFromResourcesFile(LPCWSTR filename, int cx, int cy, HICON *out) {
+    if (!filename || !out) return FALSE;
+    wchar_t path[MAX_PATH];
+    if (!GetModuleFileNameW(NULL, path, (DWORD)MAX_PATH)) return FALSE;
+    wchar_t *p = wcsrchr(path, L'\\');
+    if (p) *(p + 1) = L'\0'; else wcscpy_s(path, MAX_PATH, L".");
+    // Componer resources\filename
+    size_t need = wcslen(path) + wcslen(L"resources\\") + wcslen(filename) + 1;
+    if (need >= MAX_PATH) return FALSE;
+    wcscat_s(path, MAX_PATH, L"resources\\");
+    wcscat_s(path, MAX_PATH, filename);
+
+    HICON hIcon = (HICON)LoadImageW(NULL, path, IMAGE_ICON, cx, cy, LR_LOADFROMFILE | LR_DEFAULTCOLOR);
+    if (hIcon) { *out = hIcon; return TRUE; }
+    hIcon = (HICON)LoadImageW(NULL, path, IMAGE_ICON, 0, 0, LR_LOADFROMFILE | LR_DEFAULTCOLOR | LR_DEFAULTSIZE);
+    if (hIcon) { *out = hIcon; return TRUE; }
+    return FALSE;
+}
+
+// Cargar icono usando LoadIconWithScaleDown si está disponible (preserva canal alfa al reducir tamaño)
+// Extendido: si no se encuentra el recurso embebido, intentar cargar desde resources/PPFManager.ico
 static HICON LoadIconWithScaleDownIfAvailable(HINSTANCE hInst, LPCWSTR name, int cx, int cy) {
     typedef HRESULT (WINAPI *LoadIconWithScaleDown_t)(HINSTANCE, PCWSTR, int, int, HICON*);
     LoadIconWithScaleDown_t pLoadIconWithScaleDown = (LoadIconWithScaleDown_t)GetProcAddress(GetModuleHandleW(L"user32"), "LoadIconWithScaleDown");
@@ -92,18 +115,30 @@ static HICON LoadIconWithScaleDownIfAvailable(HINSTANCE hInst, LPCWSTR name, int
     if (pLoadIconWithScaleDown) {
         if (SUCCEEDED(pLoadIconWithScaleDown(hInst, name, cx, cy, &hIcon))) return hIcon;
     }
-    // Fallback: try LoadImage with exact size, then default sizes
+    // Alternativa: intentar LoadImage con tamaño exacto y luego tamaños por defecto (basado en recursos)
     hIcon = (HICON)LoadImageW(hInst, name, IMAGE_ICON, cx, cy, LR_DEFAULTCOLOR);
     if (hIcon) return hIcon;
     hIcon = (HICON)LoadImageW(hInst, name, IMAGE_ICON, 0, 0, LR_DEFAULTCOLOR | LR_DEFAULTSIZE);
-    return hIcon;
+    if (hIcon) return hIcon;
+
+    // Si el icono es un recurso entero (caso típico: MAKEINTRESOURCEW(101)), intentar cargar archivo externo
+    if (IS_INTRESOURCE(name)) {
+        if (TryLoadIconFromResourcesFile(L"PPFManager.ico", cx, cy, &hIcon)) return hIcon;
+        // También probar un nombre de archivo alternativo en minúsculas u otro nombre
+        if (TryLoadIconFromResourcesFile(L"ppfmanager.ico", cx, cy, &hIcon)) return hIcon;
+    } else {
+        // Si el nombre es una cadena, intentar usarla como nombre de archivo en resources/
+        if (TryLoadIconFromResourcesFile(name, cx, cy, &hIcon)) return hIcon;
+    }
+
+    return NULL;
 }
 
-/* Load icon resource at sizes scaled to `dpi` and set them on the window. Destroys previous icons if present. */
+// Cargar recurso de icono en tamaños escalados según `dpi` y establecerlos en la ventana. Destruye iconos anteriores si existen.
 static void LoadAndSetIconsForDPI(HWND hwnd, int dpi) {
     HINSTANCE hInst = GetModuleHandleW(NULL);
-    int bigSize = GetSystemMetricsForDpiSafe(SM_CXICON, dpi);
-    int smallSize = GetSystemMetricsForDpiSafe(SM_CXSMICON, dpi);
+    int bigSize = GetSystemMetricsForDpi(SM_CXICON, dpi);
+    int smallSize = GetSystemMetricsForDpi(SM_CXSMICON, dpi);
     if (g_hIconBig) { DestroyIcon(g_hIconBig); g_hIconBig = NULL; }
     if (g_hIconSmall) { DestroyIcon(g_hIconSmall); g_hIconSmall = NULL; }
 
@@ -113,9 +148,16 @@ static void LoadAndSetIconsForDPI(HWND hwnd, int dpi) {
     g_hIconSmall = LoadIconWithScaleDownIfAvailable(hInst, MAKEINTRESOURCEW(101), smallSize, smallSize);
     if (!g_hIconSmall) g_hIconSmall = (HICON)LoadImageW(hInst, MAKEINTRESOURCEW(101), IMAGE_ICON, smallSize, smallSize, LR_DEFAULTCOLOR | LR_DEFAULTSIZE);
 
+    // Diagnóstico: si faltan iconos, emitir info de depuración para que empaquetadores/testers sepan si falta el recurso
+    if (!g_hIconBig || !g_hIconSmall) {
+#if PPFMANAGER_DEBUG
+        fwprintf(stderr, L"[DEBUG] LoadAndSetIconsForDPI: g_hIconBig=%p g_hIconSmall=%p\n", g_hIconBig, g_hIconSmall);
+#endif
+    }
+
     if (g_hIconBig) {
         SendMessageW(hwnd, WM_SETICON, ICON_BIG, (LPARAM)g_hIconBig);
-        /* Also set class big icon so new windows get it */
+        // También establecer icono grande de clase para que nuevas ventanas lo obtengan
         SetClassLongPtrW(hwnd, GCLP_HICON, (LONG_PTR)g_hIconBig);
     }
     if (g_hIconSmall) {
@@ -124,7 +166,200 @@ static void LoadAndSetIconsForDPI(HWND hwnd, int dpi) {
     }
 }
 
-// Helper: convert old-style filter string ("Name\0pattern\0...") into COMDLG_FILTERSPEC
+#define PPFMANAGER_IMPLEMENTATION
+#include "ppfmanager.h"
+
+// Ayudantes compartidos (movidos aquí para centralizar implementaciones y evitar archivos helpers.*)
+
+int safe_write(int fd, const void *buf, size_t count) {
+    size_t written = 0;
+    const unsigned char *p = (const unsigned char*)buf;
+    while (written < count) {
+        size_t remaining = count - written;
+        unsigned int chunk = (remaining > (size_t)UINT_MAX) ? UINT_MAX : (unsigned int)remaining;
+        int rv = _write(fd, p + written, chunk);
+        if (rv < 0) return -1;
+        if ((size_t)rv != chunk) return -1;
+        written += rv;
+    }
+    return 0;
+}
+
+int safe_read(int fd, void *buf, size_t count) {
+    size_t read_bytes = 0;
+    unsigned char *p = (unsigned char*)buf;
+    while (read_bytes < count) {
+        unsigned int chunk = (count - read_bytes) > (size_t)UINT_MAX ? UINT_MAX : (unsigned int)(count - read_bytes);
+        int rv = _read(fd, p + read_bytes, chunk);
+        if (rv < 0) return -1;
+        if (rv == 0) return -1; // EOF inesperado
+        read_bytes += (size_t)rv;
+    }
+    return 0;
+}
+
+int read_le64(int fd, unsigned long long *out) {
+    unsigned char buf[8];
+    if (safe_read(fd, buf, 8) != 0) return -1;
+    unsigned long long v = 0;
+    for (int i = 0; i < 8; ++i) v |= ((unsigned long long)buf[i]) << (i*8);
+    *out = v;
+    return 0;
+}
+
+int read_le16(int fd, unsigned short *out) {
+    unsigned char buf[2];
+    if (safe_read(fd, buf, 2) != 0) return -1;
+    unsigned short v = (unsigned short)buf[0] | ((unsigned short)buf[1] << 8);
+    *out = v;
+    return 0;
+}
+
+int PromptYesNo(const char *prompt, int defaultYes) {
+    int result = defaultYes ? 1 : 0;
+    // Preferencia: permitir override vía variable de entorno para automatización no interactiva: si PPFMANAGER_AUTO_YES está establecida,
+    // honrarla independientemente de si stdin parece ser un TTY para evitar prompts bloqueantes en CI/tests.
+    char *env = getenv("PPFMANAGER_AUTO_YES");
+    if (env && (_stricmp(env, "1") == 0 || _stricmp(env, "true") == 0)) return 1;
+
+    if (_isatty(_fileno(stdin))) {
+        int c;
+        printf("%s", prompt); fflush(stdout);
+        c = getchar();
+        if (c == EOF) return result;
+        return (c == 'y' || c == 'Y');
+    } else {
+        return result;
+    }
+}
+
+static wchar_t *ConvertToWidePreferUtf8ThenAcp(const char *s) {
+    if (!s) return NULL;
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, s, -1, NULL, 0);
+    wchar_t *w = NULL;
+    if (wlen > 0) {
+        w = (wchar_t*)malloc(wlen * sizeof(wchar_t));
+        if (w) {
+            if (MultiByteToWideChar(CP_UTF8, 0, s, -1, w, wlen) == 0) { free(w); w = NULL; }
+            else {
+                for (int i = 0; i < wlen && w[i]; ++i) if (w[i] == 0xFFFD) { free(w); w = NULL; break; }
+            }
+        }
+    }
+    if (!w) {
+        wlen = MultiByteToWideChar(CP_ACP, 0, s, -1, NULL, 0);
+        if (wlen > 0) {
+            w = (wchar_t*)malloc(wlen * sizeof(wchar_t));
+            if (w) {
+                if (MultiByteToWideChar(CP_ACP, 0, s, -1, w, wlen) == 0) { free(w); w = NULL; }
+            }
+        }
+    }
+    return w;
+}
+
+void PrintDescriptionBytes(const unsigned char *desc) {
+    if (!desc) { int w = PPFManager_LabelWidth(); printf("%-*s : \n", w, PPFManager_DescLabelA()); return; }
+    unsigned char desc_trimmed[51];
+    memcpy(desc_trimmed, desc, 50);
+    desc_trimmed[50] = 0;
+    int len = 50; while (len > 0 && desc_trimmed[len-1] == ' ') { desc_trimmed[--len] = 0; }
+    const char *to_print = (const char*)desc_trimmed;
+
+    wchar_t *w = ConvertToWidePreferUtf8ThenAcp(to_print);
+    if (w) {
+        HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+        DWORD written = 0;
+        if (hOut && hOut != INVALID_HANDLE_VALUE) {
+            DWORD mode;
+            if (GetConsoleMode(hOut, &mode)) {
+                {
+                    int width = PPFManager_LabelWidth();
+                    wchar_t lab[64];
+                    swprintf(lab, _countof(lab), L"%-*ls : ", width, PPFManager_DescLabelW());
+                    WriteConsoleW(hOut, lab, (DWORD)wcslen(lab), &written, NULL);
+                }
+                WriteConsoleW(hOut, w, (DWORD)wcslen(w), &written, NULL);
+                WriteConsoleW(hOut, L"\n", 1, &written, NULL);
+                free(w);
+                return;
+            }
+        }
+        int need = WideCharToMultiByte(CP_UTF8, 0, w, -1, NULL, 0, NULL, NULL);
+        if (need > 0) {
+            char outbuf[1024];
+            char *out = NULL;
+            if ((size_t)need <= sizeof(outbuf)) out = outbuf; else out = (char*)malloc(need);
+            if (!out) { free(w); int z = PPFManager_LabelWidth(); printf("%-*s : %s\n", z, PPFManager_DescLabelA(), to_print); return; }
+            WideCharToMultiByte(CP_UTF8, 0, w, -1, out, need, NULL, NULL);
+            { int z = PPFManager_LabelWidth(); printf("%-*s : %s\n", z, PPFManager_DescLabelA(), out); }
+            if ((size_t)need > sizeof(outbuf)) free(out);
+        } else {
+            int z = PPFManager_LabelWidth(); printf("%-*s : %s\n", z, PPFManager_DescLabelA(), to_print);
+        }
+        free(w);
+        return;
+    }
+    printf("Description : %s\n", to_print);
+}
+
+void PrintRawTextBytes(const unsigned char *s) {
+    if (!s) { printf("\n"); return; }
+    wchar_t *w = ConvertToWidePreferUtf8ThenAcp((const char*)s);
+    if (w) {
+        HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+        DWORD written = 0, mode;
+        if (hOut && hOut != INVALID_HANDLE_VALUE && GetConsoleMode(hOut, &mode)) {
+            WriteConsoleW(hOut, w, (DWORD)wcslen(w), &written, NULL);
+            WriteConsoleW(hOut, L"\n", 1, &written, NULL);
+            free(w);
+            return;
+        }
+        int need = WideCharToMultiByte(CP_UTF8, 0, w, -1, NULL, 0, NULL, NULL);
+        if (need > 0) {
+            char outbuf[1024];
+            char *out = NULL;
+            if ((size_t)need <= sizeof(outbuf)) out = outbuf; else out = (char*)malloc(need);
+            if (!out) { free(w); printf("%s\n", s); return; }
+            WideCharToMultiByte(CP_UTF8, 0, w, -1, out, need, NULL, NULL);
+            printf("%s\n", out);
+            if ((size_t)need > sizeof(outbuf)) free(out);
+            free(w);
+            return;
+        }
+        free(w);
+    }
+    printf("%s\n", s);
+}
+
+void PrintWin32ErrorFmt(const char *fmt, ...) {
+    char prefix[512];
+    va_list ap; va_start(ap, fmt); _vsnprintf_s(prefix, sizeof(prefix), _TRUNCATE, fmt, ap); va_end(ap);
+    prefix[sizeof(prefix)-1] = '\0';
+    DWORD err = GetLastError();
+    char msg[512] = {0};
+    if (FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, NULL, err,
+                       MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), msg, sizeof(msg), NULL) > 0) {
+        size_t n = strlen(msg); while (n > 0 && (msg[n-1] == '\r' || msg[n-1] == '\n')) msg[--n] = '\0';
+        fprintf(stderr, "%s: %s (GetLastError=%lu)\n", prefix, msg, (unsigned long)err);
+    } else {
+        fprintf(stderr, "%s: GetLastError=%lu\n", prefix, (unsigned long)err);
+    }
+}
+
+int write_le64(int fd, unsigned long long val) {
+    unsigned char buf[8];
+    for (int i = 0; i < 8; ++i) buf[i] = (unsigned char)((val >> (i*8)) & 0xFF);
+    return safe_write(fd, buf, 8);
+}
+int write_le16(int fd, unsigned short val) {
+    unsigned char buf[2];
+    buf[0] = (unsigned char)(val & 0xFF);
+    buf[1] = (unsigned char)((val >> 8) & 0xFF);
+    return safe_write(fd, buf, 2);
+}
+
+// Ayudante: convertir cadena de filtro de estilo antiguo ("Name\0pattern\0...") a COMDLG_FILTERSPEC
 static COMDLG_FILTERSPEC *ParseFilterSpec(const wchar_t *filter, UINT *outCount) {
     if (!filter) { *outCount = 0; return NULL; }
     // Count pairs
@@ -153,16 +388,47 @@ static COMDLG_FILTERSPEC *ParseFilterSpec(const wchar_t *filter, UINT *outCount)
     return specs;
 }
 
-// Show Save dialog using IFileSaveDialog with initial folder; return TRUE and filename in outFilename on success
-static BOOL ShowSaveFileDialog_COM(HWND owner, wchar_t *outFilename, size_t outSize, const wchar_t *initialDir, const wchar_t *filter, HRESULT *outHr) {
+// Mostrar diálogo Guardar con IFileSaveDialog y carpeta inicial; devuelve TRUE y nombre en outFilename si tiene éxito
+// Helper: mover el cursor al final y desplazarse a la derecha cuando el final de la ruta sea larga 
+static void EditScrollToEnd(HWND hEdit) {
+    if (!hEdit) return;
+    int len = GetWindowTextLengthW(hEdit);
+    // mover el cursor al final y desplazarse a la derecha cuando el final de la ruta sea larga
+    SendMessageW(hEdit, EM_SETSEL, len, len);
+    SendMessageW(hEdit, EM_SCROLLCARET, 0, 0);
+}
+
+// convenience wrapper for when setting text programmatically
+static void SetWindowTextAndScroll(HWND hEdit, const wchar_t *text) {
+    if (!hEdit) return;
+    SetWindowTextW(hEdit, text);
+    EditScrollToEnd(hEdit);
+}
+
+static BOOL ShowSaveFileDialog_COM(HWND owner, wchar_t *outFilename, size_t outSize, const wchar_t *initialDir, const wchar_t *filter, HRESULT *outHr, DWORD flags) {
     if (outHr) *outHr = S_OK;
     HRESULT hrInit = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
     if (outHr) *outHr = hrInit;
     if (FAILED(hrInit)) return FALSE;
-    IFileSaveDialog *pfd = NULL;
-    HRESULT hr = CoCreateInstance(&CLSID_FileSaveDialog, NULL, CLSCTX_INPROC_SERVER, &IID_IFileSaveDialog, (void**)&pfd);
+
+    // choose between FileOpenDialog (for existing files) and FileSaveDialog (for creating new)
+    IFileDialog *pfd = NULL;
+    HRESULT hr;
+    BOOL useSave = !(flags & OFN_FILEMUSTEXIST);
+    if (useSave) {
+        hr = CoCreateInstance(&CLSID_FileSaveDialog, NULL, CLSCTX_INPROC_SERVER, &IID_IFileSaveDialog, (void**)&pfd);
+    } else {
+        hr = CoCreateInstance(&CLSID_FileOpenDialog, NULL, CLSCTX_INPROC_SERVER, &IID_IFileOpenDialog, (void**)&pfd);
+    }
     if (outHr) *outHr = hr;
     if (FAILED(hr)) { CoUninitialize(); return FALSE; }
+
+    // set existing-file requirement only on open dialog
+    if (!useSave && (flags & OFN_FILEMUSTEXIST)) {
+        pfd->lpVtbl->SetOptions(pfd, FOS_FILEMUSTEXIST);
+    }
+
+    // initial folder
     if (initialDir && initialDir[0]) {
         IShellItem *psiFolder = NULL;
         hr = SHCreateItemFromParsingName(initialDir, NULL, &IID_IShellItem, (void**)&psiFolder);
@@ -171,16 +437,21 @@ static BOOL ShowSaveFileDialog_COM(HWND owner, wchar_t *outFilename, size_t outS
             psiFolder->lpVtbl->Release(psiFolder);
         }
     }
+
     UINT count = 0; COMDLG_FILTERSPEC *specs = ParseFilterSpec(filter, &count);
     if (specs && count > 0) {
         pfd->lpVtbl->SetFileTypes(pfd, count, specs);
         CoTaskMemFree(specs);
     }
-    // Disable overwrite prompt - silently overwrite files
-    DWORD dwFlags;
-    if (SUCCEEDED(pfd->lpVtbl->GetOptions(pfd, &dwFlags))) {
-        pfd->lpVtbl->SetOptions(pfd, dwFlags & ~FOS_OVERWRITEPROMPT);
+
+    // Disable overwrite prompt when using save dialog, otherwise leave default
+    if (useSave) {
+        DWORD dwFlags;
+        if (SUCCEEDED(pfd->lpVtbl->GetOptions(pfd, &dwFlags))) {
+            pfd->lpVtbl->SetOptions(pfd, dwFlags & ~FOS_OVERWRITEPROMPT);
+        }
     }
+
     hr = pfd->lpVtbl->Show(pfd, owner);
     if (outHr) *outHr = hr;
     if (SUCCEEDED(hr)) {
@@ -206,53 +477,8 @@ static BOOL ShowSaveFileDialog_COM(HWND owner, wchar_t *outFilename, size_t outS
     return FALSE;
 }
 
-// Show Open dialog using IFileOpenDialog with initial folder; return TRUE and filename in outFilename on success
-static BOOL ShowOpenFileDialog_COM(HWND owner, wchar_t *outFilename, size_t outSize, const wchar_t *initialDir, const wchar_t *filter, HRESULT *outHr) {
-    if (outHr) *outHr = S_OK;
-    HRESULT hrInit = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
-    if (outHr) *outHr = hrInit;
-    if (FAILED(hrInit)) return FALSE;
-    IFileOpenDialog *pfd = NULL;
-    HRESULT hr = CoCreateInstance(&CLSID_FileOpenDialog, NULL, CLSCTX_INPROC_SERVER, &IID_IFileOpenDialog, (void**)&pfd);
-    if (outHr) *outHr = hr;
-    if (FAILED(hr)) { CoUninitialize(); return FALSE; }
-    if (initialDir && initialDir[0]) {
-        IShellItem *psiFolder = NULL;
-        hr = SHCreateItemFromParsingName(initialDir, NULL, &IID_IShellItem, (void**)&psiFolder);
-        if (SUCCEEDED(hr) && psiFolder) {
-            pfd->lpVtbl->SetFolder(pfd, psiFolder);
-            psiFolder->lpVtbl->Release(psiFolder);
-        }
-    }
-    UINT count = 0; COMDLG_FILTERSPEC *specs = ParseFilterSpec(filter, &count);
-    if (specs && count > 0) {
-        pfd->lpVtbl->SetFileTypes(pfd, count, specs);
-        CoTaskMemFree(specs);
-    }
-    hr = pfd->lpVtbl->Show(pfd, owner);
-    if (outHr) *outHr = hr;
-    if (SUCCEEDED(hr)) {
-        IShellItem *psi = NULL;
-        hr = pfd->lpVtbl->GetResult(pfd, &psi);
-        if (SUCCEEDED(hr) && psi) {
-            PWSTR pszPath = NULL;
-            hr = psi->lpVtbl->GetDisplayName(psi, SIGDN_FILESYSPATH, &pszPath);
-            if (SUCCEEDED(hr) && pszPath) {
-                wcsncpy(outFilename, pszPath, outSize - 1);
-                outFilename[outSize - 1] = 0;
-                CoTaskMemFree(pszPath);
-                psi->lpVtbl->Release(psi);
-                pfd->lpVtbl->Release(pfd);
-                CoUninitialize();
-                return TRUE;
-            }
-            psi->lpVtbl->Release(psi);
-        }
-    }
-    pfd->lpVtbl->Release(pfd);
-    CoUninitialize();
-    return FALSE;
-}
+// Mostrar diálogo Abrir con IFileOpenDialog y carpeta inicial; devuelve TRUE y nombre en outFilename si tiene éxito
+// (Eliminado, ahora se usa ShowSaveFileDialog_COM unificado)
 
 #ifndef DWMWA_USE_IMMERSIVE_DARK_MODE
 #define DWMWA_USE_IMMERSIVE_DARK_MODE 20
@@ -260,7 +486,7 @@ static BOOL ShowOpenFileDialog_COM(HWND owner, wchar_t *outFilename, size_t outS
 #ifndef DWMWA_BORDER_COLOR
 #define DWMWA_BORDER_COLOR 34
 #endif
-// Tab control color messages (not always present depending on headers)
+// Mensajes de color del control de pestañas (no siempre presentes según encabezados)
 #ifndef TCM_SETBKCOLOR
 #define TCM_SETBKCOLOR (TCM_FIRST + 67)
 #endif
@@ -274,12 +500,14 @@ static BOOL ShowOpenFileDialog_COM(HWND owner, wchar_t *outFilename, size_t outS
 static int g_console_attached = 0;
 
 #define WM_APPEND_OUTPUT (WM_APP + 100)
-#define WM_ENABLE_BROWSE (WM_APP + 101)  /* wParam: 1 enable, 0 disable */
+#define WM_ENABLE_BROWSE (WM_APP + 101)  // wParam: 1 habilitar, 0 deshabilitar
+#define WM_CREAR_PROGRESS (WM_APP + 102) // wParam: progreso 0..10000
+#define WM_APLICAR_PROGRESS (WM_APP + 103) // wParam: progreso 0..10000
 
 // Idioma actual de la UI: 0=ES, 1=EN
-enum { LANG_ES = 0, LANG_EN = 1 };
-static int g_lang = LANG_ES;
-static int g_crearValidUserSet = 0; /* 1 = user manually changed validation checkbox */
+// (enumeration defined in header; avoid duplicate)
+int g_lang = LANG_ES;
+static int g_crearValidUserSet = 0; // 1 = usuario cambió manualmente el checkbox de validación
 
 typedef struct {
     HWND hEdit;
@@ -288,7 +516,7 @@ typedef struct {
     int partial_len;
 } PROC_THREAD_PARAM;
 
-// Common styles so every button/checkbox uses the native Windows look and keyboard focus
+// Estilos comunes para que todos los botones/checkbox usen apariencia nativa de Windows y el foco de teclado
 static const DWORD BTN_STYLE = WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON;
 static const DWORD BTN_STYLE_DEFAULT = BTN_STYLE | BS_DEFPUSHBUTTON;
 static const DWORD CHK_STYLE = WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX;
@@ -296,18 +524,18 @@ static int g_themePref = 0; // 0=claro, 1=oscuro
 static bool g_isDark = false;
 static COLORREF g_clrBg = 0, g_clrText = 0, g_clrEditBg = 0, g_clrEditText = 0, g_clrBorder = 0;
 static COLORREF g_clrTabSel = 0, g_clrTabNorm = 0, g_clrTabTextSel = 0, g_clrTabTextNorm = 0;
-// Tab hover / selection animation state
-static int g_tabHover = -1;            // index currently under mouse
-static int g_tabLastSelected = -1;     // last selected index
-static int g_tabAnimFrom = -1;         // animating from index
-static int g_tabAnimTo = -1;           // animating to index
+// Estado de animación de hover/selección de pestañas
+static int g_tabHover = -1;            // índice actualmente bajo el ratón
+static int g_tabLastSelected = -1;     // último índice seleccionado
+static int g_tabAnimFrom = -1;         // animando desde índice
+static int g_tabAnimTo = -1;           // animando hacia índice
 static int g_tabAnimStep = 0;          // current animation step
 static const int TAB_ANIM_STEPS = 6;   // steps in fade animation
 static const int TAB_ANIM_INTERVAL = 30; // ms per step
 static const UINT ID_TAB_ANIM_TIMER = 0x501; // timer id for tab animation
 static HBRUSH g_brBg = NULL, g_brEditBg = NULL;
 static HFONT hFont = NULL;
-/* Shared globals used by MakePPF and ApplyPPF when building combined GUI */
+// Variables globales compartidas usadas por MakePPF y ApplyPPF al construir la GUI combinada
 int ppf = 0, bin = 0, mod = 0, fileid = 0;
 char binblock[1024];
 char ppfblock[1024];
@@ -316,12 +544,16 @@ char temp_ppfname[512] = {0};
 int using_temp = 0;
 int patch_ok = 0;
 static volatile LONG g_operation_running = 0; // Flag to prevent concurrent operations
+volatile LONG g_app_closing = 0;   // set when the GUI is closing, signals worker threads to abort
 
-/* Forward declarations for functions from ApplyPPF.c and MakePPF.c */
+// Declaraciones adelantadas para funciones de ApplyPPF.c y MakePPF.c
 extern int ApplyPPF_Main(int argc, char **argv);
 extern int MakePPF_Main(int argc, char **argv);
+extern void MakePPF_InitArgs(void);
+extern void MakePPF_SetProgressCallback(void (*cb)(double));
+extern void ApplyPPF_SetProgressCallback(void (*cb)(double));
 
-/* Reset all global variables before each operation to prevent state corruption */
+// Resetear todas las variables globales antes de cada operación para prevenir corrupción de estado
 static void ResetGlobalState(void) {
     ppf = 0;
     bin = 0;
@@ -389,22 +621,6 @@ static void UpdateControlThemes(bool dark, HWND *controls, int count) {
 
 // Owner-draw helpers removed to keep system menu rendering consistent
 
-static void ApplyMenuTheme(HMENU hMenuBar, bool dark) {
-    if (!hMenuBar) return;
-    MENUINFO mi = {0};
-    mi.cbSize = sizeof(mi);
-    mi.fMask = MIM_BACKGROUND | MIM_APPLYTOSUBMENUS | MIM_STYLE;
-    mi.dwStyle |= MNS_CHECKORBMP;
-    mi.hbrBack = dark ? g_brBg : NULL;
-    SetMenuInfo(hMenuBar, &mi);
-    int cnt = GetMenuItemCount(hMenuBar);
-    for (int i = 0; i < cnt; ++i) {
-        HMENU hSub = GetSubMenu(hMenuBar, i);
-        if (!hSub) continue;
-        SetMenuInfo(hSub, &mi);
-    }
-}
-
 static void UpdateThemeBrushes(bool dark) {
     g_isDark = dark;
     // delete previous custom brushes if any
@@ -465,7 +681,7 @@ static void UpdateLanguageMenuChecks(HMENU hMenuBar) {
     CheckMenuItem(hMenuIdioma, 302, MF_BYCOMMAND | (g_lang == LANG_EN ? MF_CHECKED : MF_UNCHECKED));
 }
 
-static void UpdatePanelEdge(HWND panel, bool dark) {
+static void UpdatePanelEdge(HWND panel) {
     if (!panel) return;
     LONG_PTR ex = GetWindowLongPtrW(panel, GWL_EXSTYLE);
     LONG_PTR newEx = ex & ~WS_EX_WINDOWEDGE; // siempre sin borde
@@ -500,8 +716,8 @@ static void ApplyCurrentTheme(bool dark, HWND hwnd, HWND hwndTab, HWND hCrearPan
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED | SWP_NOACTIVATE);
     }
     // Quitar borde 3D en paneles en modo oscuro para que no se vean claros
-    UpdatePanelEdge(hCrearPanel, dark);
-    UpdatePanelEdge(hAplicarPanel, dark);
+    UpdatePanelEdge(hCrearPanel);
+    UpdatePanelEdge(hAplicarPanel);
     UpdateCheckboxThemes(dark, chkUndo, chkValid, chkRevert);
     if (hMenuBar) {
         UpdateThemeMenuChecks(hMenuBar, dark);
@@ -514,14 +730,72 @@ static void ApplyCurrentTheme(bool dark, HWND hwnd, HWND hwndTab, HWND hCrearPan
     if (hwndTab) InvalidateRect(hwndTab, NULL, TRUE);
 }
 
-// Panel subclass globals and forward declarations
+// Variables globales y declaraciones anticipadas para subclasificar paneles
 static WNDPROC oldCrearPanelProc = NULL;
 static WNDPROC oldAplicarPanelProc = NULL;
 static WNDPROC oldTabProc = NULL;
 static WNDPROC oldComboProc = NULL;
+static WNDPROC oldAboutLinkProc = NULL;
 static HWND g_hCrearOutput = NULL;
 static HWND g_hAplicarOutput = NULL;
 static HWND g_hwndMain = NULL;
+static HWND g_hCrearTopProgress = NULL; // Handle del control de progreso global (pestaña Crear)
+
+// Control de progreso de la pestaña Aplicar (refleja ayudantes de la pestaña Crear)
+static HWND g_hAplicarTopProgress = NULL; // Handle del control de progreso global (pestaña Aplicar)
+
+// Funciones ayudantes para el control de progreso de la pestaña Crear (alcance de archivo para evitar funciones anidadas)
+static void CrearProgress_SetPos(int ipct) {
+    if (g_hCrearTopProgress && IsWindow(g_hCrearTopProgress)) {
+        SendMessageW(g_hCrearTopProgress, PBM_SETPOS, (WPARAM)ipct, 0);
+        ShowWindow(g_hCrearTopProgress, SW_SHOWNOACTIVATE);
+        EnableWindow(g_hCrearTopProgress, FALSE);
+    }
+}
+static void CrearProgress_ResetToZero(void) {
+    CrearProgress_SetPos(0);
+}
+
+// Control de progreso de la pestaña Aplicar (refleja los ayudantes de la pestaña Crear)
+static void AplicarProgress_SetPos(int ipct) {
+    if (g_hAplicarTopProgress && IsWindow(g_hAplicarTopProgress)) {
+        SendMessageW(g_hAplicarTopProgress, PBM_SETPOS, (WPARAM)ipct, 0);
+        ShowWindow(g_hAplicarTopProgress, SW_SHOWNOACTIVATE);
+        EnableWindow(g_hAplicarTopProgress, FALSE);
+    }
+}
+static void AplicarProgress_ResetToZero(void) {
+    AplicarProgress_SetPos(0);
+}
+
+// Publicador de progreso GUI a nivel superior usado por la callback de MakePPF. Declarado aquí para poder usar g_hwndMain.
+static void GuiMakePPFProgress(double pct) {
+    int ipct = (int)(pct * 100.0 + 0.5); // 0..10000
+    if (ipct < 0) ipct = 0;
+    if (ipct > 10000) ipct = 10000;
+    HWND tgt = g_hwndMain ? g_hwndMain : GetForegroundWindow();
+    PostMessageW(tgt, WM_CREAR_PROGRESS, (WPARAM)ipct, 0);
+}
+
+// Publicador de progreso de la GUI a nivel superior usado por la callback de ApplyPPF. Declarado aquí para poder usar g_hwndMain.
+static void GuiApplyProgress(double pct) {
+    static int last_ipct = -1; // remember previous value to suppress backwards jumps
+    int ipct = (int)(pct * 100.0 + 0.5); // 0..10000
+    if (ipct < 0) ipct = 0;
+    if (ipct > 10000) ipct = 10000;
+    // if percentage has regressed below what we've already shown, ignore it
+    if (last_ipct >= 0 && ipct < last_ipct) {
+        return;
+    }
+    HWND tgt = g_hwndMain ? g_hwndMain : GetForegroundWindow();
+    PostMessageW(tgt, WM_APLICAR_PROGRESS, (WPARAM)ipct, 0);
+    if (ipct >= 10000) {
+        last_ipct = -1;  // reset when finished
+    } else {
+        last_ipct = ipct;
+    }
+}
+
 // Globals for controls accessible from other functions
 static HWND g_hwndTab = NULL;
 static HWND g_hCrearPanel = NULL;
@@ -530,20 +804,107 @@ LRESULT CALLBACK CrearPanelProc(HWND hwndPanel, UINT msg, WPARAM wParam, LPARAM 
 LRESULT CALLBACK AplicarPanelProc(HWND hwndPanel, UINT msg, WPARAM wParam, LPARAM lParam);
 LRESULT CALLBACK TabProc(HWND hwndTab, UINT msg, WPARAM wParam, LPARAM lParam);
 LRESULT CALLBACK ComboProc(HWND hwndCombo, UINT msg, WPARAM wParam, LPARAM lParam);
+// Ayudante: publicar con seguridad una cadena asignada en memoria a la UI (libera en caso de fallo)
+static BOOL SafePostAllocatedString(HWND tgt, UINT msg, WPARAM wParam, wchar_t *wstr);
 static void ForceLayoutRefresh(void);
 LRESULT CALLBACK AboutWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
+
+// Implementación: publicar de forma segura una cadena amplia asignada en heap a la UI.
+// En caso de fallo (destino inválido o fallo de PostMessage), el buffer se libera para evitar fugas de memoria.
+static BOOL SafePostAllocatedString(HWND tgt, UINT msg, WPARAM wParam, wchar_t *wstr) {
+    if (!wstr) return FALSE;
+    HWND t = tgt ? tgt : GetForegroundWindow();
+    if (!t || !IsWindow(t)) { free(wstr); return FALSE; }
+    if (!PostMessageW(t, msg, wParam, (LPARAM)wstr)) { free(wstr); return FALSE; }
+    return TRUE;
+}
 
 
 // --- TRADUCCIÓN CENTRALIZADA ---
 
+// Forward declaration for T function
+static const wchar_t* T(const wchar_t* id);
+
+// Show Help dialog (modal, centered on parent)
+static void ShowHelpDialog(HWND hwnd) {
+    const wchar_t *title = T(L"help_title");
+    const wchar_t *text = T(L"help_interface");
+
+    // Registrar la clase 'About' una vez
+    static ATOM cls = 0;
+    if (!cls) {
+        WNDCLASSW wc = {0};
+        wc.lpfnWndProc = AboutWndProc;
+        wc.hInstance = GetModuleHandleW(NULL);
+        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        wc.lpszClassName = L"PPFManagerAboutClass";
+        wc.hCursor = LoadCursorW(NULL, (LPCWSTR)IDC_ARROW);
+        wc.hIcon = LoadIconWithScaleDownIfAvailable(GetModuleHandleW(NULL), MAKEINTRESOURCEW(101),
+                                                   GetSystemMetricsForDpi(SM_CXICON, GetSystemDPI()),
+                                                   GetSystemMetricsForDpi(SM_CYICON, GetSystemDPI()));
+        cls = RegisterClassW(&wc);
+    }
+
+    // Tamaño fijo escalado según DPI
+    RECT prc; GetWindowRect(hwnd, &prc);
+    int pw = prc.right - prc.left;
+    int dlgW = ScaleForWindow(hwnd, 700); // Ancho ventana ayuda
+    int dlgH = ScaleForWindow(hwnd, 460); // Alto ventana ayuda
+    {
+        int screenH = GetSystemMetrics(SM_CYSCREEN);
+        if (dlgH > screenH - 40) dlgH = screenH - 40;
+    }
+
+    int x = prc.left + (pw - dlgW) / 2;
+    int y = prc.top + ((prc.bottom - prc.top) - dlgH) / 2;
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+
+    HWND hDlg = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_WINDOWEDGE, L"PPFManagerAboutClass", title,
+                                 WS_POPUP | WS_CAPTION | WS_SYSMENU,
+                                 x, y, dlgW, dlgH, hwnd, NULL, GetModuleHandleW(NULL), (LPVOID)text);
+    if (hDlg) {
+        // Put app icon on the title bar for Help
+        HINSTANCE hInst = GetModuleHandleW(NULL);
+        int sysdpi_ab = GetSystemDPI();
+        HICON hBig = LoadIconWithScaleDownIfAvailable(hInst, MAKEINTRESOURCEW(101),
+                                                      GetSystemMetricsForDpi(SM_CXICON, sysdpi_ab),
+                                                      GetSystemMetricsForDpi(SM_CYICON, sysdpi_ab));
+        HICON hSmall = LoadIconWithScaleDownIfAvailable(hInst, MAKEINTRESOURCEW(101),
+                                                        GetSystemMetricsForDpi(SM_CXSMICON, sysdpi_ab),
+                                                        GetSystemMetricsForDpi(SM_CYSMICON, sysdpi_ab));
+        if (hBig) SendMessageW(hDlg, WM_SETICON, ICON_BIG, (LPARAM)hBig);
+        if (hSmall) SendMessageW(hDlg, WM_SETICON, ICON_SMALL, (LPARAM)hSmall);
+    }
+    if (!hDlg) {
+        MessageBoxW(hwnd, text, title, MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+
+    EnableWindow(hwnd, FALSE);
+    ShowWindow(hDlg, SW_SHOW);
+    SetActiveWindow(hDlg);
+
+    MSG msg;
+    while (IsWindow(hDlg) && GetMessageW(&msg, NULL, 0, 0)) {
+        if (!IsWindow(hDlg)) break;
+        if (!IsDialogMessage(hDlg, &msg)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+    EnableWindow(hwnd, TRUE);
+    SetActiveWindow(hwnd);
+}
+
 // Show About dialog (modal, centered on parent)
 static void ShowAboutDialog(HWND hwnd) {
     const wchar_t *title = L"PPF Manager";
-    const wchar_t *text_es = L"\nPPF Manager vpre-1.0 por PeterDelta\r\nBasado en fuentes PPF3 de Icarus/Paradox\r\n\r\nhttps://github.com/PeterDelta/MakePPF3";
-    const wchar_t *text_en = L"\nPPF Manager vpre-1.0 by PeterDelta\r\nBased on PPF3 sources by Icarus/Paradox\r\n\r\nhttps://github.com/PeterDelta/MakePPF3";
+    const wchar_t *text_es = L"\nPPF Manager 1.0 por PeterDelta\r\nBasado en fuentes PPF3 de Icarus/Paradox\r\n\r\nhttps://github.com/PeterDelta/PPFManager";
+    const wchar_t *text_en = L"\nPPF Manager 1.0 by PeterDelta\r\nBased on PPF3 sources by Icarus/Paradox\r\n\r\nhttps://github.com/PeterDelta/PPFManager";
     const wchar_t *text = (g_lang == LANG_EN) ? text_en : text_es;
 
-    /* Register about class once */
+    // Registrar la clase 'About' una vez
     static ATOM cls = 0;
     if (!cls) {
         WNDCLASSW wc = {0};
@@ -552,15 +913,15 @@ static void ShowAboutDialog(HWND hwnd) {
         wc.lpszClassName = L"PPFManagerAboutClass";
         wc.hbrBackground = (HBRUSH)(COLOR_WINDOW+1);
         wc.hCursor = LoadCursor(NULL, IDC_ARROW);
-        /* Use system DPI for about dialog class icon */
+        // Usar DPI del sistema para el icono de la clase del diálogo 'About'
         int sysdpi_local = GetSystemDPI();
         wc.hIcon = LoadIconWithScaleDownIfAvailable(wc.hInstance, MAKEINTRESOURCEW(101),
-                                                   GetSystemMetricsForDpiSafe(SM_CXICON, sysdpi_local),
-                                                   GetSystemMetricsForDpiSafe(SM_CYICON, sysdpi_local));
+                                                   GetSystemMetricsForDpi(SM_CXICON, sysdpi_local),
+                                                   GetSystemMetricsForDpi(SM_CYICON, sysdpi_local));
         cls = RegisterClassW(&wc);
     }
 
-    /* Measure text for sizing */
+    // Medir texto para calcular el tamaño
     RECT prc; GetWindowRect(hwnd, &prc);
     int pw = prc.right - prc.left;
     int maxW = pw - 80; if (maxW < 240) maxW = 240;
@@ -576,7 +937,7 @@ static void ShowAboutDialog(HWND hwnd) {
     int padX = ScaleForWindow(hwnd,24), padY = ScaleForWindow(hwnd,18), btnH = ScaleForWindow(hwnd,32);
     int dlgW = rcText.right + padX; int minDlgW = ScaleForWindow(hwnd,300); if (dlgW < minDlgW) dlgW = minDlgW;
     int dlgH = rcText.bottom + padY + btnH + ScaleForWindow(hwnd,12); int minDlgH = ScaleForWindow(hwnd,120); if (dlgH < minDlgH) dlgH = minDlgH;
-    /* Allow explicit height via env var PPFMANAGER_ABOUT_HEIGHT (pixels). If not set, default multiplier 2 */
+    // Permitir altura explícita vía variable de entorno PPFMANAGER_ABOUT_HEIGHT (píxeles). Si no está, multiplicador por defecto 2
     {
         wchar_t envbuf[32] = {0};
         if (GetEnvironmentVariableW(L"PPFMANAGER_ABOUT_HEIGHT", envbuf, 32) > 0) {
@@ -593,7 +954,8 @@ static void ShowAboutDialog(HWND hwnd) {
 
     int x = prc.left + (pw - dlgW) / 2;
     int y = prc.top + ((prc.bottom - prc.top) - dlgH) / 2;
-    if (x < 0) x = 0; if (y < 0) y = 0;
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
 
     HWND hDlg = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_WINDOWEDGE, L"PPFManagerAboutClass", title,
                                  WS_POPUP | WS_CAPTION | WS_SYSMENU,
@@ -603,11 +965,11 @@ static void ShowAboutDialog(HWND hwnd) {
         HINSTANCE hInst = GetModuleHandleW(NULL);
         int sysdpi_ab = GetSystemDPI();
         HICON hBig = LoadIconWithScaleDownIfAvailable(hInst, MAKEINTRESOURCEW(101),
-                                                      GetSystemMetricsForDpiSafe(SM_CXICON, sysdpi_ab),
-                                                      GetSystemMetricsForDpiSafe(SM_CYICON, sysdpi_ab));
+                                                      GetSystemMetricsForDpi(SM_CXICON, sysdpi_ab),
+                                                      GetSystemMetricsForDpi(SM_CYICON, sysdpi_ab));
         HICON hSmall = LoadIconWithScaleDownIfAvailable(hInst, MAKEINTRESOURCEW(101),
-                                                        GetSystemMetricsForDpiSafe(SM_CXSMICON, sysdpi_ab),
-                                                        GetSystemMetricsForDpiSafe(SM_CYSMICON, sysdpi_ab));
+                                                        GetSystemMetricsForDpi(SM_CXSMICON, sysdpi_ab),
+                                                        GetSystemMetricsForDpi(SM_CYSMICON, sysdpi_ab));
         if (hBig) SendMessageW(hDlg, WM_SETICON, ICON_BIG, (LPARAM)hBig);
         if (hSmall) SendMessageW(hDlg, WM_SETICON, ICON_SMALL, (LPARAM)hSmall);
     }
@@ -658,8 +1020,8 @@ static const wchar_t* tw(const char* key) {
             : L"Selecciona un archivo PPF para ver la información.\r\n";
     if (strcmp(key, "select_ppf_fileid") == 0)
         return (g_lang == LANG_EN)
-            ? L"Select a PPF and file_id.diz to add.\r\n"
-            : L"Selecciona PPF y file_id.diz para añadir.\r\n";
+            ? L"Select a PPF and DIZ to add.\r\n"
+            : L"Selecciona PPF y DIZ para añadir.\r\n";
     if (strcmp(key, "select_create_origname") == 0)
         return (g_lang == LANG_EN) ? L"Select the original image file.\r\n" : L"Selecciona la imagen original.\r\n";
     if (strcmp(key, "select_create_modname") == 0)
@@ -683,15 +1045,15 @@ static const wchar_t* tw(const char* key) {
     if (strcmp(key, "error_not_ppf3") == 0)
         return (g_lang == LANG_EN) ? L"Error: file '%s' is no PPF3.0 patch\n" : L"Error: el archivo '%s' no es un parche PPF3.0\n";
     if (strcmp(key, "done") == 0)
-        return (g_lang == LANG_EN) ? L"Done.\n" : L"Hecho.\n";
+        return (g_lang == LANG_EN) ? L"Done.\n" : L"Completado.\n";
     if (strcmp(key, "usage_f_addfileid") == 0)
-        return (g_lang == LANG_EN) ? L"Usage: PPFManager.exe f <ppf> <file_id.diz>\n" : L"Uso: PPFManager.exe f <ppf> <file_id.diz>\n";
+        return (g_lang == LANG_EN) ? L"Usage: PPFManager.exe f <ppf> <file.diz>\n" : L"Uso: PPFManager.exe f <ppf> <archivo.diz>\n";
     if (strcmp(key, "error_cannot_open_files") == 0)
         return (g_lang == LANG_EN) ? L"Error: cannot open file(s)\n" : L"Error: no se pueden abrir archivo(s)\n";
     if (strcmp(key, "fileid_added") == 0)
-        return (g_lang == LANG_EN) ? L"file_id.diz added successfully.\n" : L"file_id.diz a\u00f1adido correctamente.\n";
+        return (g_lang == LANG_EN) ? L"File DIZ added successfully.\n" : L"Archivo DIZ a\u00f1adido correctamente.\n";
     if (strcmp(key, "error_patch_has_fileid") == 0)
-        return (g_lang == LANG_EN) ? L"Error: patch already contains a file_id.diz\n" : L"Error: el parche ya contiene file_id.diz\n";
+        return (g_lang == LANG_EN) ? L"Error: patch already contains a file DIZ\n" : L"Error: el parche ya contiene un archivo DIZ\n";
     if (strcmp(key, "filter_ppf") == 0)
         return (g_lang == LANG_EN) ? L"PPF files" : L"Archivos PPF";
     if (strcmp(key, "filter_all") == 0)
@@ -712,24 +1074,127 @@ static const wchar_t* tw(const char* key) {
         return (g_lang == LANG_EN) ? L"PPF2 patch applied.\n" : L"Parche PPF2 aplicado.\n";
     if (strcmp(key, "ppf3_applied") == 0)
         return (g_lang == LANG_EN) ? L"PPF3 patch applied.\n" : L"Parche PPF3 aplicado.\n";
+    if (strcmp(key, "ppf_apply_failed") == 0)
+        return (g_lang == LANG_EN) ? L"Error: failed to apply patch.\n" : L"Error: fallo al aplicar el parche.\n";
     if (strcmp(key, "unknown_patch_version") == 0)
         return (g_lang == LANG_EN) ? L"Unknown patch version.\n" : L"Versi\u00f3n de parche desconocida.\n";
     if (strcmp(key, "ppf3_undo_applied") == 0)
         return (g_lang == LANG_EN) ? L"PPF3 patch undo applied.\n" : L"Deshacer parche PPF3 aplicado.\n";
     if (strcmp(key, "undo_supported_only_ppf3") == 0)
         return (g_lang == LANG_EN) ? L"Undo function is supported by PPF3.0 only\n" : L"La funci\u00f3n deshacer solo est\u00e1 soportada por PPF3.0\n";
-    if (strcmp(key, "console_help") == 0)
-        return (g_lang == LANG_EN)
-            ? L"\nUsage: PPFManager.exe <Commands> <Image File> <patch>\n<Commands>\n  c : create PPF3.0 patch            f : add file_id.diz\n  s : show patch information\n  a : apply PPF1/2/3 patch\n  u : undo patch (PPF3 only)\n<Switches>\n -u : include undo data (default=off)\n -x : disable patch validation (default=off)\n -i : imagetype, 0 = BIN, 1 = GI, 2 = ISO (default=bin)\n -d : \"write description\"\n -f : \"file_id.diz\" to insert the file into the patch\n\nExamples: PPF c -u -i 0 -d \"my patch\" game.bin mod.bin output.ppf\n          PPF f patch.ppf myfileid.diz\n"
-            : L"\nUso: PPFManager.exe <Comandos> <Archivo Imagen> <parche>\n<Comandos>\n  c : crear parche PPF3.0            f : a\u00f1adir file_id.diz\n  s : mostrar informaci\u00f3n del parche\n  a : aplicar parche PPF1/2/3\n  u : deshacer parche (solo PPF3)\n<Opciones>\n -u : incluir datos undo (por defecto=off)\n -x : desactivar comprobaci\u00f3n de parche (por defecto=off)\n -i : tipo de imagen, 0 = BIN, 1 = GI, 2 = ISO (por defecto=bin)\n -d : \"escribir descripci\u00f3n\"\n -f : \"file_id.diz\" para insertar el archivo en el parche\n\nEjemplos: PPF c -u -i 0 -d \"mi parche\" game.bin mod.bin output.ppf\n          PPF f patch.ppf myfileid.diz\n"; 
+    if (strcmp(key, "file_id_name") == 0)
+        return (g_lang == LANG_EN) ? L"file_id.diz" : L"Archivo.diz";
+    if (strcmp(key, "console_help") == 0) {
+        /* dynamically insert localized file-id label */
+        static wchar_t buf[2048];
+        const wchar_t *fid = tw("file_id_name");
+        if (g_lang == LANG_EN) {
+            swprintf(buf, _countof(buf),
+                L"\nUsage: PPFManager.exe <Commands> <Image File> <patch>\n"
+                L"<Commands>\n  c : create PPF3.0 patch            f : add %ls\n"
+                L"  s : show patch information\n  a : apply PPF1/2/3 patch\n"
+                L"  u : undo patch (PPF3 only)\n<Switches>\n"
+                L" -u : include undo data (default=off)\n"
+                L" -x : disable patch validation (default=off)\n"
+                L" -i : imagetype, 0 = BIN, 1 = GI, 2 = ISO (default=bin)\n"
+                L" -d : \"write description\"\n"
+                L" -f : \"%ls\" to insert the file into the patch\n\n"
+                L"Examples: PPF c -u -i 0 -d \"my patch\" game.bin mod.bin output.ppf\n"
+                L"          PPF f patch.ppf myfileid.diz\n",
+                fid, fid);
+        } else {
+            swprintf(buf, _countof(buf),
+                L"\nUso: PPFManager.exe <Comandos> <Archivo Imagen> <parche>\n"
+                L"<Comandos>\n  c : crear parche PPF3.0            f : a\u00f1adir %ls\n"
+                L"  s : mostrar informaci\u00f3n del parche\n  a : aplicar parche PPF1/2/3\n"
+                L"  u : deshacer parche (solo PPF3)\n<Opciones>\n"
+                L" -u : incluir datos undo (por defecto=apagado)\n"
+                L" -x : desactivar comprobaci\u00f3n de parche (por defecto=apagado)\n"
+                L" -i : tipo de imagen, 0 = BIN, 1 = GI, 2 = ISO (por defecto=bin)\n"
+                L" -d : \"escribir descripci\u00f3n\"\n"
+                L" -f : \"%ls\" para insertar el archivo en el parche\n\n"
+                L"Ejemplos: PPF c -u -i 0 -d \"mi parche\" original.bin mod.bin salida.ppf\n"
+                L"          PPF f parche.ppf archivo.diz\n",
+                fid, fid);
+        }
+        return buf;
+    }
     if (strcmp(key, "error_unknown_command") == 0)
-        return (g_lang == LANG_EN) ? L"Error: Unknown command\n" : L"Error: comando desconocido\n";
+        return (g_lang == LANG_EN) ? L"Error: unknown command\n" : L"Error: comando desconocido\n";
     return L"";
 }
 
-// Console output helpers: format wide strings (from tw()) and print as UTF-8 to stdout
+
+/* helper returning the localized filename used by the "add file_id" feature.
+   wide version is convenient for internal formatting, the ANSI/UTF-8 version
+   is used by helper tools such as MakePPF.c which run outside the GUI. */
+const wchar_t *PPFManager_FileIdNameW(void) {
+    if (g_lang == LANG_EN) return L"file_id.diz";
+    /* example Spanish translation; add other languages if needed */
+    if (g_lang == LANG_ES) return L"Archivo.diz";
+    return L"file_id.diz";
+}
+
+const char *PPFManager_FileIdNameA(void) {
+    static char buf[64];
+    WideCharToMultiByte(CP_UTF8, 0, PPFManager_FileIdNameW(), -1, buf, sizeof(buf), NULL, NULL);
+    return buf;
+}
+
+const wchar_t *PPFManager_AddingW(void) {
+    if (g_lang == LANG_EN) return L"Adding";
+    if (g_lang == LANG_ES) return L"Añadiendo";
+    return L"Adding";
+}
+
+const char *PPFManager_AddingA(void) {
+    static char buf2[64];
+    WideCharToMultiByte(CP_UTF8, 0, PPFManager_AddingW(), -1, buf2, sizeof(buf2), NULL, NULL);
+    return buf2;
+}
+
+const wchar_t *PPFManager_DescLabelW(void) {
+    return (g_lang == LANG_EN) ? L"Description" : L"Descripci\u00f3n";
+}
+
+const char *PPFManager_DescLabelA(void) {
+    static char buf[64];
+    WideCharToMultiByte(CP_UTF8, 0, PPFManager_DescLabelW(), -1, buf, sizeof(buf), NULL, NULL);
+    return buf;
+}
+
+int PPFManager_LabelWidth(void) {
+    /* start with description/file-id pair */
+    const wchar_t *d = PPFManager_DescLabelW();
+    const wchar_t *f = PPFManager_FileIdNameW();
+    size_t m = wcslen(d) > wcslen(f) ? wcslen(d) : wcslen(f);
+    /* include other fixed headers that appear in ShowPatchInfo */
+    const wchar_t *others[] = {
+        (g_lang == LANG_EN) ? L"Version" : L"Versi\u00f3n",
+        (g_lang == LANG_EN) ? L"Enc.Method" : L"M\u00e9todo Enc.",
+        (g_lang == LANG_EN) ? L"Imagetype" : L"Tipo de imagen",
+        (g_lang == LANG_EN) ? L"Validation" : L"Validaci\u00f3n",
+        (g_lang == LANG_EN) ? L"Undo Data" : L"Datos Deshacer",
+    };
+    for (size_t i = 0; i < sizeof(others)/sizeof(others[0]); ++i) {
+        size_t len = wcslen(others[i]);
+        if (len > m) m = len;
+    }
+    return (int)m;
+}
+
+// Console output helpers: format wide strings (from tw()) and print appropriately to stdout
+// If stdout is a real console, use WriteConsoleW to emit Unicode directly (avoids mojibake).
+// Otherwise (redirect or pipe), emit UTF-8 bytes so consumers receive UTF-8.
 static void ConsolePutW(const wchar_t *w) {
     if (!w) return;
+    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    DWORD mode;
+    if (hOut && hOut != INVALID_HANDLE_VALUE && GetConsoleMode(hOut, &mode)) {
+        DWORD written = 0;
+        WriteConsoleW(hOut, w, (DWORD)wcslen(w), &written, NULL);
+        return;
+    }
     int len = WideCharToMultiByte(CP_UTF8, 0, w, -1, NULL, 0, NULL, NULL);
     if (len <= 0) return;
     char *buf = (char*)malloc(len);
@@ -760,18 +1225,18 @@ static void ConsolePrintfKeyMB(const char *key, const char *mb) {
     }
     int wlen = MultiByteToWideChar(CP_UTF8, 0, mb, -1, NULL, 0);
     if (wlen <= 0) {
-        // fallback: try ANSI
+        // alternativa: probar ANSI
         wlen = MultiByteToWideChar(CP_ACP, 0, mb, -1, NULL, 0);
     }
     if (wlen <= 0) return;
     wchar_t *argW = (wchar_t*)malloc(wlen * sizeof(wchar_t));
     if (!argW) return;
     if (!MultiByteToWideChar(CP_UTF8, 0, mb, -1, argW, wlen)) {
-        // fallback to ANSI
+        // alternativa: usar ANSI
         MultiByteToWideChar(CP_ACP, 0, mb, -1, argW, wlen);
     }
     wchar_t tmp[4096];
-    _snwprintf(tmp, sizeof(tmp)/sizeof(wchar_t), fmtW, argW);
+    _snwprintf_s(tmp, sizeof(tmp)/sizeof(wchar_t), _TRUNCATE, fmtW, argW);
     ConsolePutW(tmp);
     free(argW);
 }
@@ -803,34 +1268,35 @@ static const UI_TEXT_ENTRY UI_TEXTS[] = {
     {L"menu_lang", L"Idioma", L"Language"},
     {L"menu_theme", L"Tema", L"Theme"},
     {L"menu_help", L"Ayuda", L"Help"},
-    {L"menu_help_show", L"Mostrar ayuda", L"Show help"},
+    {L"menu_help_show", L"Ayuda", L"Help"},
     {L"menu_about", L"Acerca de", L"About"},
     {L"menu_es", L"Español", L"Spanish"},
     {L"menu_en", L"Inglés", L"English"},
     {L"menu_dark", L"Oscuro", L"Dark"},
     {L"menu_light", L"Claro", L"Light"},
-    {L"lbl_img", L"Imagen original:", L"Original image:"},
-    {L"lbl_mod", L"Imagen modificada:", L"Modified image:"},
-    {L"lbl_ppf_dest", L"Archivo PPF destino:", L"Output PPF file:"},
-    {L"lbl_diz", L"File_id.diz (opcional):", L"File_id.diz (optional):"},
-    {L"lbl_desc", L"Descripción (opcional):", L"Description (optional):"},
+    {L"lbl_img", L"Imagen original", L"Original image"},
+    {L"lbl_mod", L"Imagen modificada", L"Modified image"},
+    {L"lbl_ppf_dest", L"Archivo PPF", L"PPF file"},
+    {L"lbl_diz", L"Archivo DIZ", L"DIZ file"},
+    {L"lbl_desc", L"Descripción", L"Description"},
     {L"chk_undo", L"Incluir datos de deshacer", L"Include undo data"},
     {L"chk_valid", L"Activar validación", L"Enable validation"},
     {L"lbl_tipo", L"Imagen:", L"Image:"},
     {L"btn_create", L"Crear Parche", L"Create Patch"},
     {L"btn_show", L"Info Parche", L"Patch Info"},
-    {L"btn_add", L"Añadir file_id", L"Add file_id.diz"},
+    {L"btn_add", L"Añadir .diz", L"Add .diz"},
     {L"btn_clear", L"Limpiar", L"Clear"},
-    {L"lbl_salida", L"Salida:", L"Output:"},
-    {L"lbl_img_apply", L"Imagen original:", L"Original image:"},
-    {L"lbl_ppf_apply", L"Archivo PPF:", L"PPF file:"},
+    {L"lbl_img_apply", L"Imagen original", L"Original image"},
+    {L"lbl_ppf_apply", L"Archivo PPF", L"PPF file"},
     {L"chk_revert", L"Deshacer parche", L"Undo patch"},
     {L"btn_apply", L"Aplicar Parche", L"Apply Patch"},
     {L"btn_clear_apply", L"Limpiar", L"Clear"},
-    {L"lbl_salida_apply", L"Salida:", L"Output:"}
+    {L"lbl_salida_apply", L" ", L" "},
+    {L"help_title", L"Ayuda de PPFManager", L"PPFManager Help"},
+    {L"help_interface", L"Pestaña Crear Parche:\n  - Imagen original — Seleccionar la imagen sin modificar.\n  - Imagen modificada — Seleccionar la imagen modificada.\n  - Archivo PPF — Elegir el nombre del parche, se agrega automáticamente al añadir la Imagen original.\n  - Archivo DIZ (opcional) — Archivo que contiene texto informativo del parche y se inserta dentro del .ppf\n  - Descripción (opcional) — Añade una descripción y se inserta dentro del .ppf\n Opciones:\n  - Incluir datos deshacer — Incluye información para revertir los cambios realizados y devolver la imagen original.\n  - Activar validación — Protección para asegurar que no se pueda aplicar el parche en una imagen diferente\n  - Imagen — Elegir tipo de imagen .bin .gi .iso\n\n  - Botón Crear Parche — Ejecuta la creación del parche en la ubicacion establecida.\n  - Botón Info Parche — Muestra la información del .ppf agregado en el campo 'Archivo PPF'.\n  - Botón Añadir .diz — Añade un archivo.diz al parche.\n  - Botón Limpiar — Limpia la salida de la consola.\n\nPestaña Aplicar Parche:\n  - Imagen original — Seleccionar la imagen original\n  - Archivo PPF — Seleccionar el parche para aplicar en la imagen\n  - Deshacer parche — Revierte la aplicación del parche. (El .ppf tiene que haber sido creado con estos datos)", L"Create Patch tab:\n  - Original image — Select the unmodified image.\n  - Modified image — Select the modified image.\n  - PPF file — Choose the patch name, it is added automatically when selecting the Original image.\n  - File.diz (optional) — File that contains informative text about the patch and is inserted inside the .ppf\n  - Description (optional) — Adds a description and is inserted inside the .ppf\n Options:\n  - Include undo data — Includes information to revert the changes made and restore the original image.\n  - Enable validation — Protection to ensure that the patch cannot be applied to a different image\n  - Image — Choose image type .bin .gi .iso\n\n  - Create Patch button — Executes the patch creation at the established location.\n  - Patch Info button — Displays the .ppf file information added in the 'PPF file' field.\n  - Add file.diz button — Adds a file.diz file to the patch.\n  - Clear button — Clears the console output.\n\nApply Patch tab:\n  - Original image — Select the original image\n  - PPF file — Select the patch to apply to the image\n  - Undo patch — Reverts the application of the patch. (The .ppf must have been created with these data)"},
 };
 static const wchar_t* T(const wchar_t* id) {
-    for (int i = 0; i < sizeof(UI_TEXTS)/sizeof(UI_TEXTS[0]); ++i) {
+    for (size_t i = 0; i < sizeof(UI_TEXTS)/sizeof(UI_TEXTS[0]); ++i) {
         if (wcscmp(UI_TEXTS[i].id, id) == 0)
             return (g_lang == LANG_EN) ? UI_TEXTS[i].en : UI_TEXTS[i].es;
     }
@@ -844,6 +1310,7 @@ static void TranslateUI(HWND hwndTab, HWND hCrearPanel, HWND hAplicarPanel,
     HWND hAplicarLblImg, HWND hAplicarLblPPF, HWND hAplicarChkRevert, HWND hAplicarBtnApply, HWND hAplicarBtnClear, HWND hAplicarLblSalida,
     HMENU hMenuBar, HMENU hMenuIdioma, HMENU hMenuTema, HMENU hMenuAyuda) {
     // Tabs
+    (void)hCrearLblSalida;
     TCITEMW tie = {0};
     tie.mask = TCIF_TEXT;
     tie.pszText = (LPWSTR)T(L"tab_create");
@@ -885,8 +1352,8 @@ static void TranslateUI(HWND hwndTab, HWND hCrearPanel, HWND hAplicarPanel,
     ModifyMenuW(hMenuIdioma, 1, MF_BYPOSITION | MF_STRING, 302, T(L"menu_en"));
     ModifyMenuW(hMenuTema, 0, MF_BYPOSITION | MF_STRING, 203, T(L"menu_dark"));
     ModifyMenuW(hMenuTema, 1, MF_BYPOSITION | MF_STRING, 204, T(L"menu_light"));
-    ModifyMenuW(hMenuAyuda, 0, MF_BYPOSITION | MF_STRING, 206, T(L"menu_about"));
-    ModifyMenuW(hMenuAyuda, 1, MF_BYPOSITION | MF_STRING, 207, T(L"menu_help_show"));
+    ModifyMenuW(hMenuAyuda, 1, MF_BYPOSITION | MF_STRING, 206, T(L"menu_about"));
+    ModifyMenuW(hMenuAyuda, 0, MF_BYPOSITION | MF_STRING, 205, T(L"menu_help_show"));
     // Título ventana
     SetWindowTextW(g_hwndMain, L"PPF Manager");
 }
@@ -945,11 +1412,12 @@ static void BuildCreateCmdLine(wchar_t *out, size_t outSize, HWND hImg, HWND hMo
         int sel = (int)SendMessageW(hComboTipo, CB_GETCURSEL, 0, 0);
         int itype = (sel >= 0 && sel <= 2) ? sel : 0; // default to BIN if out of range
         wchar_t itbuf[8];
-        _snwprintf(itbuf, sizeof(itbuf)/sizeof(wchar_t), L"%d", itype);
+        _snwprintf_s(itbuf, sizeof(itbuf)/sizeof(wchar_t), _TRUNCATE, L"%d", itype);
         wcscat_s(out, outSize, L" -i ");
         AppendQuotedArg(out, outSize, itbuf);
     }
     if (hDesc && GetWindowTextW(hDesc, buf, MAX_PATH) && wcslen(buf) > 0) {
+        if (wcslen(buf) > 50) buf[50] = 0; // Asegurar descripción <= 50 caracteres
         wcscat_s(out, outSize, L" -d ");
         AppendQuotedArg(out, outSize, buf);
     }
@@ -1014,7 +1482,7 @@ static void MaybeSetImageTypeFromPath(HWND hComboTipo, HWND hChkValid, const wch
     if (!path || wcslen(path) == 0) return;
     const wchar_t *dot = wcsrchr(path, L'.');
     if (!dot) return;
-    /* Recognized extensions (case-insensitive): .bin -> BIN (0), .gi -> GI (1), .iso -> ISO (2) */
+    // Extensiones reconocidas (insensible a mayúsculas): .bin -> BIN (0), .gi -> GI (1), .iso -> ISO (2)
     if (_wcsicmp(dot, L".iso") == 0) {
         if (hComboTipo) SendMessageW(hComboTipo, CB_SETCURSEL, 2, 0);
         if (!g_crearValidUserSet && hChkValid) SendMessageW(hChkValid, BM_SETCHECK, BST_UNCHECKED, 0);
@@ -1037,17 +1505,18 @@ static void GetSettingsFilePath(wchar_t *out, size_t outSize) {
     }
     // Ensure folder exists
     wchar_t folder[MAX_PATH];
-    _snwprintf(folder, MAX_PATH, L"%s\\MakePPF", appdata);
+    _snwprintf_s(folder, MAX_PATH, _TRUNCATE, L"%s\\PPFManager", appdata);
     CreateDirectoryW(folder, NULL);
-    _snwprintf(out, outSize, L"%s\\settings.ini", folder);
+    _snwprintf_s(out, outSize, _TRUNCATE, L"%s\\settings.ini", folder);
 }
 
 // Load settings from INI and populate controls (tolerant)
 static void LoadSettings(HWND hCrearEditImg, HWND hCrearEditMod, HWND hCrearEditPPF, HWND hCrearEditDIZ, HWND hCrearEditDesc, HWND hCrearChkUndo, HWND hCrearChkValid, HWND hCrearComboTipo,
                          HWND hAplicarEditImg, HWND hAplicarEditPPF, HWND hAplicarChkRevert) {
     wchar_t inipath[MAX_PATH];
+    // Parámetros intencionalmente no usados (se mantienen por compatibilidad de firma)
+    (void)hCrearEditImg; (void)hCrearEditMod; (void)hCrearEditPPF; (void)hCrearEditDIZ; (void)hAplicarEditImg; (void)hAplicarEditPPF; 
     GetSettingsFilePath(inipath, MAX_PATH);
-    wchar_t buf[MAX_PATH];
     // Crear: do NOT restore saved paths or description. Checks are NOT persisted.
     // Default behavior: all checkboxes disabled except 'Activar validación' which defaults to checked.
     if (hCrearEditDesc) SetWindowTextW(hCrearEditDesc, L"");
@@ -1064,7 +1533,7 @@ static void LoadSettings(HWND hCrearEditImg, HWND hCrearEditMod, HWND hCrearEdit
             int top = GetPrivateProfileIntW(L"Window", L"Top", CW_USEDEFAULT, inipath);
             // Ignore saved positions that indicate a minimized window (Windows uses -32000) or clearly invalid values
             if (left == CW_USEDEFAULT || top == CW_USEDEFAULT || left <= -32000 || top <= -32000) {
-                /* ignore minimized/invalid saved pos */
+                // Ignorar posición guardada minimizada/inválida
             } else {
                 // Ensure position within reasonable screen bounds before applying
                 int screenW = GetSystemMetrics(SM_CXSCREEN);
@@ -1093,15 +1562,16 @@ static void LoadSettings(HWND hCrearEditImg, HWND hCrearEditMod, HWND hCrearEdit
         }
     }
     // Restore theme preference (0 claro, 1 oscuro)
-    g_themePref = GetPrivateProfileIntW(L"Window", L"ThemeDark", 0, inipath) ? 1 : 0;
+    g_themePref = GetPrivateProfileIntW(L"Window", L"ThemeDark", 1, inipath) ? 1 : 0;
 }
 
 // Save settings from controls to INI
 static void SaveSettings(HWND hCrearEditImg, HWND hCrearEditMod, HWND hCrearEditPPF, HWND hCrearEditDIZ, HWND hCrearEditDesc, HWND hCrearChkUndo, HWND hCrearChkValid, HWND hCrearComboTipo,
                          HWND hAplicarEditImg, HWND hAplicarEditPPF, HWND hAplicarChkRevert) {
     wchar_t inipath[MAX_PATH];
+    // Ninguno de los parámetros de control se persiste; marcarlos explícitamente como no usados
+    (void)hCrearEditImg; (void)hCrearEditMod; (void)hCrearEditPPF; (void)hCrearEditDIZ; (void)hCrearEditDesc; (void)hCrearChkUndo; (void)hCrearChkValid; (void)hCrearComboTipo; (void)hAplicarEditImg; (void)hAplicarEditPPF; (void)hAplicarChkRevert;
     GetSettingsFilePath(inipath, MAX_PATH);
-    wchar_t buf[MAX_PATH];
     // Do NOT save path fields or control/check states. Only save window position on exit.
     if (g_hwndMain) {
         // Prefer the normal (restored) position so we don't persist minimized coordinates
@@ -1110,29 +1580,29 @@ static void SaveSettings(HWND hCrearEditImg, HWND hCrearEditMod, HWND hCrearEdit
             RECT rc = wp.rcNormalPosition;
             int left = rc.left; int top = rc.top;
             wchar_t sbuf[64];
-            _snwprintf(sbuf, 64, L"%d", left); WritePrivateProfileStringW(L"Window", L"Left", sbuf, inipath);
-            _snwprintf(sbuf, 64, L"%d", top); WritePrivateProfileStringW(L"Window", L"Top", sbuf, inipath);
+            _snwprintf_s(sbuf, 64, _TRUNCATE, L"%d", left); WritePrivateProfileStringW(L"Window", L"Left", sbuf, inipath);
+            _snwprintf_s(sbuf, 64, _TRUNCATE, L"%d", top); WritePrivateProfileStringW(L"Window", L"Top", sbuf, inipath);
             WritePrivateProfileStringW(L"Window", L"HasPos", L"1", inipath);
         } else {
-            // fallback: use current window rect if placement failed
+            // alternativa: usar rectángulo de ventana actual si el posicionamiento falla
             RECT rc; GetWindowRect(g_hwndMain, &rc);
             int left = rc.left; int top = rc.top;
             wchar_t sbuf[64];
-            _snwprintf(sbuf, 64, L"%d", left); WritePrivateProfileStringW(L"Window", L"Left", sbuf, inipath);
-            _snwprintf(sbuf, 64, L"%d", top); WritePrivateProfileStringW(L"Window", L"Top", sbuf, inipath);
+            _snwprintf_s(sbuf, 64, _TRUNCATE, L"%d", left); WritePrivateProfileStringW(L"Window", L"Left", sbuf, inipath);
+            _snwprintf_s(sbuf, 64, _TRUNCATE, L"%d", top); WritePrivateProfileStringW(L"Window", L"Top", sbuf, inipath);
             WritePrivateProfileStringW(L"Window", L"HasPos", L"1", inipath);
         }
     }
     // Save language selection
     {
         wchar_t lbuf[4];
-        _snwprintf(lbuf, 4, L"%d", (g_lang == LANG_EN) ? 1 : 0);
+        _snwprintf_s(lbuf, 4, _TRUNCATE, L"%d", (g_lang == LANG_EN) ? 1 : 0);
         WritePrivateProfileStringW(L"Window", L"LangEn", lbuf, inipath);
     }
     // Save theme preference (0 claro, 1 oscuro)
     {
         wchar_t tbuf[4];
-        _snwprintf(tbuf, 4, L"%d", g_themePref ? 1 : 0);
+        _snwprintf_s(tbuf, 4, _TRUNCATE, L"%d", g_themePref ? 1 : 0);
         WritePrivateProfileStringW(L"Window", L"ThemeDark", tbuf, inipath);
     }
 }
@@ -1141,7 +1611,8 @@ static void SaveSettings(HWND hCrearEditImg, HWND hCrearEditMod, HWND hCrearEdit
 static void AppendTextToEdit(HWND hEdit, const wchar_t *text) {
     if (!IsWindow(hEdit) || !text) return;
     // set selection to end
-    SendMessageW(hEdit, EM_SETSEL, (WPARAM)-1, (LPARAM)-1);
+    int len = GetWindowTextLengthW(hEdit);
+    SendMessageW(hEdit, EM_SETSEL, len, len);
     SendMessageW(hEdit, EM_REPLACESEL, FALSE, (LPARAM)text);
     // scroll to caret
     SendMessageW(hEdit, EM_SCROLLCARET, 0, 0);
@@ -1181,6 +1652,162 @@ static wchar_t* ReplaceAllWide(const wchar_t *src, const wchar_t *find, const wc
     return out;
 }
 
+// Single-pass multi-replacer (checks case-sensitive first then case-insensitive in rule order)
+// This avoids multiple full-text passes when applying many small replacements.
+// Centralized, deduplicated translation tables are defined below so all UI strings live in one place
+// for easier maintenance and future i18n extraction.
+typedef struct { const wchar_t *find; const wchar_t *repl; } TranslationRule;
+
+static wchar_t *ReplaceMultipleWideSinglePass(const wchar_t *src, const TranslationRule *rules, size_t n) {
+    if (!src || !rules || n == 0) return NULL;
+    size_t srcLen = wcslen(src);
+    // start with a reasonably sized buffer
+    size_t outCap = srcLen + 64;
+    wchar_t *out = (wchar_t*)malloc((outCap + 1) * sizeof(wchar_t));
+    if (!out) return NULL;
+    size_t outLen = 0;
+
+    size_t pos = 0;
+    while (pos < srcLen) {
+        int matched = 0;
+        // First try case-sensitive rules in order
+        for (size_t i = 0; i < n; ++i) {
+            const wchar_t *find = rules[i].find;
+            const wchar_t *repl = rules[i].repl;
+            if (!find || !*find) continue;
+            size_t fl = wcslen(find);
+            if (pos + fl <= srcLen && wcsncmp(src + pos, find, fl) == 0) {
+                size_t rl = wcslen(repl);
+                // ensure capacity
+                if (outLen + rl + 1 > outCap) {
+                    while (outLen + rl + 1 > outCap) outCap *= 2;
+                    wchar_t *nb = (wchar_t*)realloc(out, (outCap + 1) * sizeof(wchar_t));
+                    if (!nb) { free(out); return NULL; }
+                    out = nb;
+                }
+                memcpy(out + outLen, repl, rl * sizeof(wchar_t));
+                outLen += rl;
+                pos += fl;
+                matched = 1;
+                break; // apply single match and continue at new position
+            }
+        }
+        if (matched) continue;
+
+        // Then try case-insensitive rules in order (skip no-op case-insensitive equalities)
+        for (size_t i = 0; i < n; ++i) {
+            const wchar_t *find = rules[i].find;
+            const wchar_t *repl = rules[i].repl;
+            if (!find || !*find) continue;
+            if (_wcsicmp(find, repl) == 0) continue; // preserve previous behavior (no-op CI replacement)
+            size_t fl = wcslen(find);
+            if (pos + fl <= srcLen) {
+                int ok = 1;
+                for (size_t k = 0; k < fl; ++k) {
+                    if (towlower((wint_t)src[pos + k]) != towlower((wint_t)find[k])) { ok = 0; break; }
+                }
+                if (ok) {
+                    size_t rl = wcslen(repl);
+                    if (outLen + rl + 1 > outCap) {
+                        while (outLen + rl + 1 > outCap) outCap *= 2;
+                        wchar_t *nb = (wchar_t*)realloc(out, (outCap + 1) * sizeof(wchar_t));
+                        if (!nb) { free(out); return NULL; }
+                        out = nb;
+                    }
+                    memcpy(out + outLen, repl, rl * sizeof(wchar_t));
+                    outLen += rl;
+                    pos += fl;
+                    matched = 1;
+                    break;
+                }
+            }
+        }
+        if (matched) continue;
+
+        // No rule matched at this position; copy single character
+        if (outLen + 2 > outCap) {
+            outCap *= 2;
+            wchar_t *nb = (wchar_t*)realloc(out, (outCap + 1) * sizeof(wchar_t));
+            if (!nb) { free(out); return NULL; }
+            out = nb;
+        }
+        out[outLen++] = src[pos++];
+    }
+    out[outLen] = 0;
+    return out;
+}
+
+// Centralized, deduplicated translation rules (English -> Spanish)
+static const TranslationRule g_translation_rules[] = {
+    { L"Writing header...", L"Escribiendo cabecera..." },
+    { L"Adding file .diz...", L"Añadiendo archivo .diz..." },
+    { L"Finding differences...", L"Buscando diferencias..." },
+    { L"Progress:", L"Progreso:" },
+    { L"entries found", L"entradas encontradas" },
+    { L"entries", L"entradas" },
+    { L"Error: insufficient memory available", L"Error: memoria insuficiente disponible" },
+    { L"Error: filesize of bin file is zero!", L"Error: el tamaño del archivo bin es cero!" },
+    { L"Error: input files are different in size.", L"Error: los archivos de entrada tienen distinto tamaño." },
+    { L"Error: short read of bin validation block", L"Error: lectura corta del bloque de validación bin" },
+    { L"Warning: short read of bin validation block", L"Aviso: lectura corta del bloque de validación bin" },
+    { L"Error: need more input for command", L"Error: falta entrada para el comando" },
+    { L"Error: cannot open file \"", L"Error: no se puede abrir el archivo \"" },
+    { L"Error: cannot open file ", L"Error: no se puede abrir el archivo " },
+    { L"Error: file ", L"Error: el archivo " },
+    { L"Error: patch already contains a file .diz", L"Error: el parche ya contiene un archivo .diz" },
+    { L"Error: cannot create temp file for", L"Error: no se puede crear archivo temporal para" },
+    { L"Showing patchinfo", L"Mostrando información del parche" },
+    { L"Enabled", L"Habilitado." },
+    { L"Disabled", L"Deshabilitado." },
+    { L"Done.", L"Completado." },
+    { L"Patching...", L"Parcheando..." },
+    { L"Patching ...", L"Parcheando ..." },
+    { L"Patch Information:", L"Información del parche:" },
+    { L"Patchfile is a PPF3.0 patch.", L"El archivo es un parche PPF3.0." },
+    { L"Patchfile is a PPF1.0 patch. Patch Information:", L"El archivo es un parche PPF1.0. Información del parche:" },
+    { L"Patchfile is a PPF2.0 patch. Patch Information:", L"El archivo es un parche PPF2.0. Información del parche:" },
+    { L"The size of the bin file isn't correct, continue ? (y/n): ", L"El tamaño del archivo bin no es correcto, \u00BFcontinuar? (s/n): " },
+    { L"Binblock/Patchvalidation failed. ISO images sometimes require validation disabled (-x). continue ? (y/n): ", L"La validaci\u00f3n del bloque bin fall\u00f3. Las im\u00e1genes ISO a veces requieren desactivar la validaci\u00f3n (-x). \u00BFContinuar? (s/n): " },
+    { L"Binblock/Patchvalidation failed. continue ? (y/n): ", L"La validaci\u00f3n del bloque bin fall\u00f3. \u00BFContinuar? (s/n): " },
+    { L"Not available", L"No disponible" },
+    { L"Available", L"Disponible" },
+    { L"unknown command", L"Comando desconocido" },
+    { L"Executing:", L"Ejecutando:" },
+    { L"Aborted...", L"Abortado..." },
+    { L"Usage: PPF <command> [-<sw> [-<sw>...]] <original bin> <modified bin> <ppf>", L"Uso: PPF <comando> [-<sw> [-<sw>...]] <Imagen original> <Imagen modificado> <ppf>" },
+    { L"<Commands>", L"<Comandos>" },
+    { L"  c : create PPF3.0 patch            f : add file .diz", L"  c : crear parche PPF3.0            f : añadir archivo .diz" },
+    { L"  s : show patchinfomation", L"  s : mostrar información del parche" },
+    { L"<Switches>", L"<Interruptores>" },
+    { L" -u : include undo data (default=off)", L" -u        : incluir datos de deshacer (por defecto=apagado)" },
+    { L" -x : disable patchvalidation (default=off)", L" -x : deshabilitar validación de parche (por defecto=apagado)" },
+    { L" -i : imagetype, 0 = BIN, 1 = GI, 2 = ISO (default=bin)", L" -i : tipo de imagen, 0 = BIN, 1 = GI, 2 = ISO (por defecto=bin)" },
+    { L" -d : use \"text\" as description", L" -d : usar \"texto\" como descripción" },
+    { L" -f \"file\" : add \"file\" as file.diz", L" -f \"archivo\" : añadir \"archivo\" como archivo.diz" },
+    { L"Examples: PPF c -u -i 1 -d \"my elite patch\" game.bin patch.bin output.ppf", L"Ejemplos: PPF c -u -i 1 -d \"mi parche elite\" juego.bin parche.bin salida.ppf" },
+    { L"          PPF f patch.ppf myfileid.diz", L"          PPF f patch.ppf fileid.diz" },
+    { L"Usage: PPFManager.exe <command> <binfile> <patchfile>", L"Uso: PPFManager.exe <comando> <archivo bin> <archivo parche>" },
+    { L"  a : apply PPF1/2/3 patch", L"  a : aplicar parche PPF1/2/3" },
+    { L"  u : undo patch (PPF3 only)", L"  u : deshacer parche (solo PPF3)" }
+};
+
+// Pares de etiquetas centralizados y deduplicados usados para reemplazos que preservan etiquetas y alineación.
+// Mantener idempotente: aplicar reemplazos múltiples veces no debe tener efecto adicional (mapeo idéntico).
+static const struct { const wchar_t *en; const wchar_t *es; } g_label_pairs[] = {
+    { L"Version", L"Versión" },
+    { L"Enc.Method", L"Método Enc." },
+    { L"Imagetype", L"Tipo de imagen" },
+    { L"Validation", L"Validación" },
+    { L"Undo Data", L"Datos Deshacer" },
+    { L"Description", L"Descripción" },
+    { L"File .diz", L"Archivo .diz" }
+};
+
+// Notas:
+// - El orden de las reglas importa para la idempotencia; las reglas se aplican de izquierda a derecha y están diseñadas para que
+//   volver a aplicar traducciones no tenga efecto adicional (mapeo idempotente).
+// - Mantener estas tablas sincronizadas con los tests y asegurarse de añadir cualquier nueva cadena visible en la UI aquí
+//   para que las herramientas de traducción puedan extraerlas fácilmente.
 // Extract just filename from a path in a command line, keeping quotes
 static wchar_t* StripPathsFromCommand(const wchar_t *cmdline) {
     if (!cmdline) return NULL;
@@ -1253,34 +1880,8 @@ static wchar_t *wcsistr(const wchar_t *hay, const wchar_t *needle) {
     return NULL;
 }
 
-// Replace all occurrences (case-insensitive) of 'find' with 'repl' inside buf (reallocs if necessary).
-static wchar_t *ReplaceSubstringCI(wchar_t *buf, size_t *bufSize, const wchar_t *find, const wchar_t *repl) {
-    if (!buf || !bufSize || !find || !repl) return buf;
-    size_t findLen0 = wcslen(find);
-    if (findLen0 == 0) return buf;
-    if (_wcsicmp(find, repl) == 0) return buf; // no-op replacement would never progress
-
-    wchar_t *scan = buf;
-    while ((scan = wcsistr(scan, find)) != NULL) {
-        size_t curLen = wcslen(buf);
-        size_t findLen = wcslen(find);
-        size_t replLen = wcslen(repl);
-        size_t newLen = curLen - findLen + replLen;
-        if (newLen + 1 > *bufSize) {
-            size_t newSize = (*bufSize) * 2;
-            if (newSize < newLen + 1) newSize = newLen + 1;
-            wchar_t *nb = (wchar_t*)realloc(buf, newSize * sizeof(wchar_t));
-            if (!nb) break;
-            ptrdiff_t off = scan - buf;
-            buf = nb; *bufSize = newSize; scan = buf + off;
-        }
-        wchar_t *after = scan + findLen;
-        memmove(scan + replLen, after, (wcslen(after) + 1) * sizeof(wchar_t));
-        memcpy(scan, repl, replLen * sizeof(wchar_t));
-        scan += replLen; // continue after replacement
-    }
-    return buf;
-}
+// NOTE: Replaced by ReplaceMultipleWideSinglePass to optimize multiple replacements in one pass.
+// The old case-insensitive in-place replacer is intentionally removed.
 
 // Replace label-only occurrences like "Version   : value" preserving value. Case-insensitive label match.
 static wchar_t *ReplaceLabelCI(wchar_t *buf, size_t *bufSize, const wchar_t *label_en, const wchar_t *label_es) {
@@ -1299,9 +1900,9 @@ static wchar_t *ReplaceLabelCI(wchar_t *buf, size_t *bufSize, const wchar_t *lab
             if (newLen + 1 > *bufSize) {
                 size_t newSize = (*bufSize) * 2;
                 if (newSize < newLen + 1) newSize = newLen + 1;
+                ptrdiff_t off = found - buf;
                 wchar_t *nb = (wchar_t*)realloc(buf, newSize * sizeof(wchar_t));
                 if (!nb) break;
-                ptrdiff_t off = found - buf;
                 buf = nb; *bufSize = newSize; found = buf + off;
             }
             wchar_t *after = found + enLen;
@@ -1326,123 +1927,57 @@ static wchar_t* TranslateConsoleLine(const wchar_t *line) {
     if (!buf) return _wcsdup(line);
     wcscpy(buf, line);
 
-    // Simple substring replacements (order matters for idempotence)
-    struct { const wchar_t *find; const wchar_t *repl; } rules[] = {
-        // MakePPF common
-        { L"Writing header...", L"Escribiendo cabecera..." },
-        { L"Adding file_id.diz...", L"Añadiendo file_id.diz..." },
-        { L"Finding differences...", L"Buscando diferencias..." },
-        { L"Progress:", L"Progreso:" },
-        { L"entries found", L"entradas encontradas" },
-        { L"entries", L"entradas" },
-        { L"Version", L"Versión" },
-        { L"Enc.Method", L"Método Enc." },
-        { L"Imagetype", L"Tipo de imagen" },
-        { L"Validation", L"Validación" },
-        { L"Undo Data", L"Datos Deshacer" },
-        { L"Description", L"Descripción" },
-        { L"File.id_diz", L"File.id_diz" },
-        { L"Error: insufficient memory available", L"Error: memoria insuficiente disponible" },
-        { L"Error: filesize of bin file is zero!", L"Error: el tamaño del archivo bin es cero!" },
-        { L"Error: input files are different in size.", L"Error: los archivos de entrada tienen distinto tamaño." },
-        { L"Error: need more input for command", L"Error: falta entrada para el comando" },
-        { L"Error: cannot open file \"", L"Error: no se puede abrir el archivo \"" },
-        { L"Error: cannot open file ", L"Error: no se puede abrir el archivo " },
-        { L"Error: file ", L"Error: el archivo " },
-        { L"Error: patch already contains a file_id.diz", L"Error: el parche ya contiene file_id.diz" },
-        { L"Error: cannot create temp file for", L"Error: no se puede crear archivo temporal para" },
-        { L"Showing patchinfo", L"Mostrando información del parche" },
-        { L"Done.", L"Finalizado." },
-        { L"done.", L"Hecho." },
-        { L"Enabled", L"Habilitado." },
-        { L"Disabled", L"Deshabilitado." },
-        { L"No such file or directory", L"El archivo o directorio no existe." },
-        // ApplyPPF common (fallbacks in case English output is produced)
-        { L"Patching...", L"Parcheando..." },
-        { L"Patching ...", L"Parcheando ..." },
-        { L"reading...", L"leyendo..." },
-        { L"writing...", L"escribiendo..." },
-        { L"successful.", L"Finalizado." },
-        { L"Patch Information:", L"Información del parche:" },
-        { L"Patchfile is a PPF3.0 patch.", L"El archivo es un parche PPF3.0." },
-        { L"Patchfile is a PPF1.0 patch. Patch Information:", L"El archivo es un parche PPF1.0. Información del parche:" },
-        { L"Patchfile is a PPF2.0 patch. Patch Information:", L"El archivo es un parche PPF2.0. Información del parche:" },
-        { L"The size of the bin file isn't correct, continue ? (y/n): ", L"El tamaño del archivo bin no es correcto, \u00BFcontinuar? (s/n): " },
-        { L"Binblock/Patchvalidation failed. ISO images sometimes require validation disabled (-x). continue ? (y/n): ", L"La validaci\u00f3n del bloque bin fall\u00f3. Las im\u00e1genes ISO a veces requieren desactivar la validaci\u00f3n (-x). \u00BFContinuar? (s/n): " },
-        { L"Binblock/Patchvalidation failed. continue ? (y/n): ", L"La validaci\u00f3n del bloque bin fall\u00f3. \u00BFContinuar? (s/n): " },
-        { L"Not available", L"No disponible" },
-        { L"Available", L"Disponible" },
-        { L"Unknown command", L"Comando desconocido" },
-        { L"unknown command", L"Comando desconocido" },
-        { L"Executing:", L"Ejecutando:" },
-        { L"Execute:", L"Ejecutando:" },
-        { L"Done.", L"Finalizado." },
-        { L"Aborted...", L"Abortado..." },
-        { L"Usage: PPF <command> [-<sw> [-<sw>...]] <original bin> <modified bin> <ppf>", L"Uso: PPF <comando> [-<sw> [-<sw>...]] <Imagen original> <Imagen modificado> <ppf>" },
-        { L"<Commands>", L"<Comandos>" },
-        { L"  c : create PPF3.0 patch            f : add file_id.diz", L"  c : crear parche PPF3.0            f : añadir file_id.diz" },
-        { L"  s : show patchinfomation", L"  s : mostrar información del parche" },
-        { L"<Switches>", L"<Interruptores>" },
-        { L" -u : include undo data (default=off)", L" -u        : incluir datos de deshacer (por defecto=apagado)" },
-        { L" -x : disable patchvalidation (default=off)", L" -x : deshabilitar validación de parche (por defecto=apagado)" },
-        { L" -i : imagetype, 0 = BIN, 1 = GI, 2 = ISO (default=bin)", L" -i : tipo de imagen, 0 = BIN, 1 = GI, 2 = ISO (por defecto=bin)" },
-        { L" -d : use \"text\" as description", L" -d : usar \"texto\" como descripción" },
-        { L" -f \"file\" : add \"file\" as file_id.diz", L" -f \"archivo\" : añadir \"archivo\" como file_id.diz" },
-        { L"Examples: PPF c -u -i 1 -d \"my elite patch\" game.bin patch.bin output.ppf", L"Ejemplos: PPF c -u -i 1 -d \"mi parche elite\" juego.bin parche.bin salida.ppf" },
-        { L"          PPF f patch.ppf myfileid.diz", L"          PPF f patch.ppf fileid.diz" },
-        { L"Usage: PPFManager.exe <command> <binfile> <patchfile>", L"Uso: PPFManager.exe <comando> <archivo bin> <archivo parche>" },
-        { L"  a : apply PPF1/2/3 patch", L"  a : aplicar parche PPF1/2/3" },
-        { L"  u : undo patch (PPF3 only)", L"  u : deshacer parche (solo PPF3)" },
-    };
-
-    // Apply each rule conservatively using ReplaceAllWide
-    for (size_t i = 0; i < sizeof(rules)/sizeof(rules[0]); ++i) {
-        wchar_t *r = ReplaceAllWide(buf, rules[i].find, rules[i].repl);
-        if (r) {
-            free(buf);
-            buf = r;
+    // Hook de pruebas: establecer PPFMANAGER_NO_SUPPRESS=1 para desactivar la supresión automática de bloques de ayuda/uso
+    // Esto ayuda en depuración cuando la salida parece faltar debido a filtrado
+    char *no_suppress = getenv("PPFMANAGER_NO_SUPPRESS");
+    if (!no_suppress) {
+        // Suppress console-mode help blocks in GUI: hide usage/commands/examples lines (EN/ES)
+        // IMPORTANTE: Hacer esto ANTES de las traducciones para que los patrones coincidan
+        const wchar_t *p = buf;
+        while (*p == L' ' || *p == L'\t' || *p == L'\r' || *p == L'\n') p++;
+        const wchar_t *suppress_patterns[] = {
+            L"Usage:", L"Uso:",
+            L"<Commands>", L"<Comandos>",
+            L"<Switches>", L"<Interruptores>", L"<Opciones>",
+            L"Examples:", L"Ejemplos:", L"Example:", L"Ejemplo:",
+            L"  c :", L"  s :", L"  a :", L"  u :", L"  f :",
+            L" -u ", L" -x ", L" -i ", L" -d ", L" -f ",
+            L"PPF a ", L"PPF c ", L"PPF s ", L"PPF f ",
+            L"          PPF"
+        };
+        for (size_t i = 0; i < sizeof(suppress_patterns)/sizeof(suppress_patterns[0]); ++i) {
+            const wchar_t *pat = suppress_patterns[i];
+            size_t plen = wcslen(pat);
+            if (_wcsnicmp(p, pat, (int)plen) == 0) { free(buf); return NULL; }
+            if (wcsstr(buf, pat)) { free(buf); return NULL; }
         }
     }
 
-    // Also attempt case-insensitive replacements to catch variants and spacing differences
-    for (size_t i = 0; i < sizeof(rules)/sizeof(rules[0]); ++i) {
-        buf = ReplaceSubstringCI(buf, &bufSize, rules[i].find, rules[i].repl);
+    // Replaced by centralized translation table `g_translation_rules` above.
+    // See g_translation_rules for all mappings and idempotence notes.
+
+    // Apply all rules in a single pass (case-sensitive first, then case-insensitive)
+    {
+        wchar_t *r = ReplaceMultipleWideSinglePass(buf, g_translation_rules, sizeof(g_translation_rules)/sizeof(g_translation_rules[0]));
+        if (r) { free(buf); buf = r; }
     }
 
-    // Run label-preserving replacements (Version : value, etc.)
-    struct { const wchar_t *en; const wchar_t *es; } labels[] = {
-        { L"Version", L"Versión" },
-        { L"Enc.Method", L"Método Enc." },
-        { L"Imagetype", L"Tipo de imagen" },
-        { L"Validation", L"Validación" },
-        { L"Undo Data", L"Datos Deshacer" },
-        { L"Description", L"Descripción" },
-        { L"File.id_diz", L"File.id_diz" }
-    };
-    for (size_t i = 0; i < sizeof(labels)/sizeof(labels[0]); ++i) {
-        buf = ReplaceLabelCI(buf, &bufSize, labels[i].en, labels[i].es);
+    // Run label-preserving replacements (Version : value, etc.) using centralized label pairs
+    for (size_t i = 0; i < sizeof(g_label_pairs)/sizeof(g_label_pairs[0]); ++i) {
+        buf = ReplaceLabelCI(buf, &bufSize, g_label_pairs[i].en, g_label_pairs[i].es);
     }
 
     // Log translation (no-op by default unless PPFMANAGER_DEBUG is set)
     DebugLogTranslate(line, buf);
 
-    // Align colon for several known key/value lines so colons are vertically aligned in monospaced output
+    // Align colon for known key/value lines so colons are vertically aligned in monospaced output
     {
-        const wchar_t* align_keys[] = {
-            L"Version", L"Versión",
-            L"Enc.Method", L"Método Enc.",
-            L"Imagetype", L"Tipo de imagen",
-            L"Validation", L"Validación",
-            L"Undo Data", L"Datos Deshacer",
-            L"Description", L"Descripción",
-            L"File.id_diz"
-        };
         const int align_width = 15; // desired minimum key column width
         // find first non-space char
         const wchar_t *p = buf;
         while (*p == L' ') p++;
-        for (size_t i = 0; i < sizeof(align_keys)/sizeof(align_keys[0]); ++i) {
-            const wchar_t *k = align_keys[i];
+        for (size_t i = 0; i < sizeof(g_label_pairs)/sizeof(g_label_pairs[0]); ++i) {
+            const wchar_t *k = g_label_pairs[i].en; // check English label first
             size_t klen = wcslen(k);
             if (wcslen(p) >= klen && _wcsnicmp(p, k, klen) == 0) {
                 wchar_t *colon = wcschr((wchar_t*)p, L':');
@@ -1461,6 +1996,34 @@ static wchar_t* TranslateConsoleLine(const wchar_t *line) {
                     int pad = align_width - (int)wcslen(keytxt);
                     if (pad < 1) pad = 1;
                     // build new string: preserve original leading spaces
+                    int lead = (int)(p - buf);
+                    size_t newlen = wcslen(buf) + pad + 4;
+                    wchar_t *nb = (wchar_t*)malloc((newlen + 1) * sizeof(wchar_t));
+                    if (!nb) break;
+                    nb[0] = 0;
+                    for (int s = 0; s < lead; ++s) wcscat(nb, L" ");
+                    wcscat(nb, keytxt);
+                    for (int s = 0; s < pad; ++s) wcscat(nb, L" ");
+                    wcscat(nb, L": ");
+                    wcscat(nb, val);
+                    free(buf);
+                    buf = nb;
+                }
+                break;
+            }
+            // also check Spanish variants to handle pre-translated lines
+            k = g_label_pairs[i].es; klen = wcslen(k);
+            if (wcslen(p) >= klen && _wcsnicmp(p, k, klen) == 0) {
+                wchar_t *colon = wcschr((wchar_t*)p, L':');
+                if (colon) {
+                    size_t kl = colon - p;
+                    while (kl > 0 && p[kl-1] == L' ') kl--;
+                    wchar_t keytxt[128] = {0};
+                    if (kl >= sizeof(keytxt)/sizeof(wchar_t)) kl = sizeof(keytxt)/sizeof(wchar_t) - 1;
+                    wcsncpy(keytxt, p, kl);
+                    keytxt[kl] = 0;
+                    const wchar_t *val = colon + 1; while (*val == L' ') val++;
+                    int pad = align_width - (int)wcslen(keytxt); if (pad < 1) pad = 1;
                     int lead = (int)(p - buf);
                     size_t newlen = wcslen(buf) + pad + 4;
                     wchar_t *nb = (wchar_t*)malloc((newlen + 1) * sizeof(wchar_t));
@@ -1745,8 +2308,6 @@ static void RestoreStdout(StdoutRedirect *redirect) {
 static DWORD WINAPI IntegratedExecutionThread(LPVOID lpParam) {
     PROC_THREAD_PARAM *p = (PROC_THREAD_PARAM*)lpParam;
     HWND postTarget = g_hwndMain ? g_hwndMain : GetForegroundWindow();
-    StdoutRedirect redirect;
-    ZeroMemory(&redirect, sizeof(redirect));
     int stdout_redirected = 0;
     int lock_acquired = 0;
 
@@ -1760,7 +2321,7 @@ static DWORD WINAPI IntegratedExecutionThread(LPVOID lpParam) {
     // Check if another operation is already running
     if (InterlockedCompareExchange(&g_operation_running, 1, 0) != 0) {
         wchar_t *warn = _wcsdup(L"⚠️ Operación ya en curso. Por favor espera a que termine.\r\n\r\n");
-        PostMessageW(postTarget, WM_APPEND_OUTPUT, (WPARAM)p->hEdit, (LPARAM)warn);
+        SafePostAllocatedString(postTarget, WM_APPEND_OUTPUT, (WPARAM)p->hEdit, warn);
         free(p);
         return 1;
     }
@@ -1770,54 +2331,24 @@ static DWORD WINAPI IntegratedExecutionThread(LPVOID lpParam) {
     wchar_t cmdline[1024];
     wcscpy(cmdline, p->cmdline);
     
-    // Convert wide command line to argv array using proper parsing.
-    // IMPORTANT: do NOT use fixed-size narrow buffers (UTF-8 may expand) -> causes heap/stack corruption.
-    
-    wchar_t *ptr = cmdline;
-    
-    // Skip leading spaces
-    while (*ptr && iswspace(*ptr)) ptr++;
-    
-    while (*ptr && argc < (MAX_GUI_ARGS - 1)) {
-        wchar_t arg_buf[MAX_PATH * 4];
-        int arg_len = 0;
-        int in_quotes = 0;
-        
-        // Parse one argument
-        while (*ptr && (in_quotes || !iswspace(*ptr))) {
-            if (*ptr == L'"') {
-                in_quotes = !in_quotes;
-                ptr++; // Skip the quote character
-            } else {
-                if (arg_len < MAX_PATH * 2 - 1) {
-                    arg_buf[arg_len++] = *ptr;
+    // Parse wide command line into argc/argv using Windows API (respeta comillas)
+    int wargc = 0;
+    wchar_t **wargv_temp = CommandLineToArgvW(cmdline, &wargc);
+    if (wargv_temp && wargc > 0) {
+        // Copiar argumentos a nuestros arrays
+        for (int i = 0; i < wargc && i < MAX_GUI_ARGS; i++) {
+            wargv[i] = _wcsdup(wargv_temp[i]);
+            // Convert to ANSI (CP_ACP) - MakePPF/ApplyPPF expect system codepage encoding
+            int need = WideCharToMultiByte(CP_ACP, 0, wargv_temp[i], -1, NULL, 0, NULL, NULL);
+            if (need > 0) {
+                argv[i] = (char*)malloc((size_t)need);
+                if (argv[i]) {
+                    WideCharToMultiByte(CP_ACP, 0, wargv_temp[i], -1, argv[i], need, NULL, NULL);
                 }
-                ptr++;
             }
-        }
-        
-        // Store the argument (wide)
-        if (arg_len > 0) {
-            arg_buf[arg_len] = 0;
-            wargv[argc] = _wcsdup(arg_buf);
-            if (!wargv[argc]) break;
-
-            int need = WideCharToMultiByte(CP_UTF8, 0, wargv[argc], -1, NULL, 0, NULL, NULL);
-            UINT cp = CP_UTF8;
-            if (need <= 0) {
-                cp = CP_ACP;
-                need = WideCharToMultiByte(cp, 0, wargv[argc], -1, NULL, 0, NULL, NULL);
-            }
-            if (need <= 0) break;
-
-            argv[argc] = (char*)malloc((size_t)need);
-            if (!argv[argc]) break;
-            WideCharToMultiByte(cp, 0, wargv[argc], -1, argv[argc], need, NULL, NULL);
             argc++;
         }
-        
-        // Skip trailing spaces
-        while (*ptr && iswspace(*ptr)) ptr++;
+        LocalFree(wargv_temp);
     }
     
     // Show command header
@@ -1832,15 +2363,15 @@ static DWORD WINAPI IntegratedExecutionThread(LPVOID lpParam) {
         if (repl) { free(shortbuf); shortbuf = repl; }
         
         wchar_t tmp[2048];
-        _snwprintf(tmp, 2048, tw("exec"), shortbuf);
+        _snwprintf_s(tmp, 2048, _TRUNCATE, tw("exec"), shortbuf);
         // Separator (post as its own message so it always appears distinctly)
         {
-            const wchar_t *sepLine = L"____________________________________________________________";
+            const wchar_t *sepLine = L"———————————————————————————————————————————————————";
             size_t capSep = wcslen(sepLine) + 3;
             wchar_t *wsep = (wchar_t*)malloc(capSep * sizeof(wchar_t));
             if (wsep) {
                 swprintf_s(wsep, capSep, L"%s\r\n", sepLine);
-                PostMessageW(postTarget, WM_APPEND_OUTPUT, (WPARAM)p->hEdit, (LPARAM)wsep);
+                SafePostAllocatedString(postTarget, WM_APPEND_OUTPUT, (WPARAM)p->hEdit, wsep);
             }
         }
         {
@@ -1848,21 +2379,42 @@ static DWORD WINAPI IntegratedExecutionThread(LPVOID lpParam) {
             wchar_t *wbuf = (wchar_t*)malloc(cap * sizeof(wchar_t));
             if (wbuf) {
                 swprintf_s(wbuf, cap, L"%s\r\n\r\n", tmp);
-                PostMessageW(postTarget, WM_APPEND_OUTPUT, (WPARAM)p->hEdit, (LPARAM)wbuf);
+                SafePostAllocatedString(postTarget, WM_APPEND_OUTPUT, (WPARAM)p->hEdit, wbuf);
             }
         }
         free(shortbuf);
     }
     
     // Redirect stdout to buffer
-    if (!RedirectStdout(&redirect)) {
-        // Do not abort the whole operation; run without capture.
-        wchar_t msg[256];
-        _snwprintf(msg, 256, L"Aviso: no se pudo capturar stdout; ejecutando sin captura. (errno=%d winerr=%lu)\r\n", redirect.last_errno, (unsigned long)redirect.last_winerr);
-        wchar_t *err = _wcsdup(msg);
-        if (err) PostMessageW(postTarget, WM_APPEND_OUTPUT, (WPARAM)p->hEdit, (LPARAM)err);
-    } else {
-        stdout_redirected = 1;
+    char temp_stdout_path[MAX_PATH] = {0};
+    char temp_stderr_path[MAX_PATH] = {0};
+    
+    // Get temp directory and create secure temp files via Win32 API
+    char temp_dir[MAX_PATH];
+    if (GetTempPathA(MAX_PATH, temp_dir) > 0) {
+        // Create unique temp file names (GetTempFileName creates the file atomically)
+        if (GetTempFileNameA(temp_dir, "PPF", 0, temp_stdout_path) && GetTempFileNameA(temp_dir, "PPF", 0, temp_stderr_path)) {
+            // Redirect stdout and stderr using freopen; the files already exist and are empty
+            FILE *fout = freopen(temp_stdout_path, "w+b", stdout);
+            FILE *ferr = freopen(temp_stderr_path, "w+b", stderr);
+            if (fout && ferr) {
+                stdout_redirected = 1;
+                setvbuf(stdout, NULL, _IONBF, 0);
+                setvbuf(stderr, NULL, _IONBF, 0);
+            } else {
+                // If freopen failed, close any partially opened handles and remove files
+                if (fout) fclose(fout);
+                if (ferr) fclose(ferr);
+                DeleteFileA(temp_stdout_path);
+                DeleteFileA(temp_stderr_path);
+                temp_stdout_path[0] = '\0'; temp_stderr_path[0] = '\0';
+            }
+        }
+    }
+    
+    if (!stdout_redirected) {
+        // Alternativa: llamar directamente sin captura
+        // No es lo ideal, pero mejor que fallar por completo
     }
     
     // Determine which command to execute
@@ -1875,91 +2427,139 @@ static DWORD WINAPI IntegratedExecutionThread(LPVOID lpParam) {
         
         // Check if it's MakePPF or ApplyPPF
         if (strstr(exe_name, "MakePPF") || strstr(exe_name, "makeppf")) {
+            // Check if this is a "show info" operation (contains " s" command)
+            int is_show_info = 0;
+            if (argc >= 2 && strcmp(argv[1], "s") == 0) {
+                is_show_info = 1;
+            }
+            
+            if (!is_show_info) {
+                // Instalar callback de progreso GUI para que MakePPF pueda reportar porcentaje en tiempo real
+                // Asegurar que la UI muestre 0% inmediatamente
+                PostMessageW(postTarget, WM_CREAR_PROGRESS, (WPARAM)0, 0);
+                MakePPF_SetProgressCallback(GuiMakePPFProgress);
+            }
             result = MakePPF_Main(argc, argv);
+            if (!is_show_info) {
+                MakePPF_SetProgressCallback(NULL);
+                // Asegurar que la UI muestre 100% al completar
+                PostMessageW(postTarget, WM_CREAR_PROGRESS, (WPARAM)10000, 0);
+            }
         } else if (strstr(exe_name, "ApplyPPF") || strstr(exe_name, "applyppf")) {
+            // Instalar callback de progreso GUI para que ApplyPPF pueda reportar porcentaje en tiempo real
+            // Asegurar que la UI muestre 0% inmediatamente
+            PostMessageW(postTarget, WM_APLICAR_PROGRESS, (WPARAM)0, 0);
+            ApplyPPF_SetProgressCallback(GuiApplyProgress);
             result = ApplyPPF_Main(argc, argv);
+            ApplyPPF_SetProgressCallback(NULL);
+            // Asegurar que la UI muestre 100% al completar
+            PostMessageW(postTarget, WM_APLICAR_PROGRESS, (WPARAM)10000, 0);
         } else {
-            printf("Error: Unknown command\n");
+            ConsolePrintfKey("error_unknown_command");
             result = 1;
         }
     }
     
-    // Restore stdout if redirected
+    // Restore stdout/stderr if redirected
     if (stdout_redirected) {
-        RestoreStdout(&redirect);
-    }
-    
-    // Process captured output from buffer
-    if (stdout_redirected && redirect.buffer && redirect.buffer[0] != 0) {
-        char *start = redirect.buffer;
-        char *end = redirect.buffer + redirect.buffer_size;
+        fflush(stdout);
+        fflush(stderr);
+        fclose(stdout);
+        fclose(stderr);
         
-        // Process lines (support both '\n' and '\r' as line terminators)
-        while (start < end) {
-            char *nl = (char*)memchr(start, '\n', (size_t)(end - start));
-            char *cr = (char*)memchr(start, '\r', (size_t)(end - start));
-            char *eol = NULL;
-            if (nl && cr) eol = (nl < cr) ? nl : cr;
-            else eol = nl ? nl : cr;
-
-            size_t linelen = eol ? (size_t)(eol - start + 1) : (size_t)(end - start);
+        // Read captured output
+        FILE *read_out = fopen(temp_stdout_path, "rb");
+        if (read_out) {
+            fseek(read_out, 0, SEEK_END);
+            long size64 = ftell(read_out);
+            fseek(read_out, 0, SEEK_SET);
             
-            char linebuf[4096];
-            if (linelen >= sizeof(linebuf)) linelen = sizeof(linebuf)-1;
-            memcpy(linebuf, start, linelen);
-            linebuf[linelen] = 0;
-            
-            // Trim trailing CR/LF
-            size_t real_len = linelen;
-            while (real_len > 0 && (linebuf[real_len-1] == '\n' || linebuf[real_len-1] == '\r')) {
-                linebuf[--real_len] = 0;
-            }
-            // Trim trailing spaces/tabs to avoid GUI word-wrap creating "blank" lines
-            while (real_len > 0 && (linebuf[real_len-1] == ' ' || linebuf[real_len-1] == '\t')) {
-                linebuf[--real_len] = 0;
-            }
-            // Convert to wide (handle empty lines too)
-            int wlen = MultiByteToWideChar(CP_UTF8, 0, linebuf, -1, NULL, 0);
-            wchar_t *wline = NULL;
-            if (wlen <= 0) {
-                wlen = MultiByteToWideChar(CP_ACP, 0, linebuf, -1, NULL, 0);
-                if (wlen > 0) {
-                    wline = (wchar_t*)malloc(wlen * sizeof(wchar_t));
-                    MultiByteToWideChar(CP_ACP, 0, linebuf, -1, wline, wlen);
-                }
-            } else {
-                wline = (wchar_t*)malloc(wlen * sizeof(wchar_t));
-                MultiByteToWideChar(CP_UTF8, 0, linebuf, -1, wline, wlen);
-            }
-
-            if (wline) {
-                wchar_t *tline = TranslateConsoleLine(wline);
-                free(wline);
-                if (tline) {
-                    size_t tlen = wcslen(tline);
-                    wchar_t *wbuf = (wchar_t*)malloc((tlen + 3) * sizeof(wchar_t));
-                    if (wbuf) {
-                        wcscpy(wbuf, tline);
-                        wcscat(wbuf, L"\r\n");
-                        PostMessageW(postTarget, WM_APPEND_OUTPUT, (WPARAM)p->hEdit, (LPARAM)wbuf);
+            if (size64 > 0 && size64 < 10*1024*1024) {
+                char *buffer = (char*)malloc((size_t)size64 + 1);
+                if (buffer) {
+                    size_t nread = fread(buffer, 1, (size_t)size64, read_out);
+                    buffer[nread] = 0;
+                    
+                    // Process line by line
+                    char *line_start = buffer;
+                    char *line_end = buffer;
+                    while (*line_end) {
+                        if (*line_end == '\n' || *line_end == '\r') {
+                            *line_end = 0;
+                            if (line_start < line_end) {
+                                // Convert to wide char
+                                int wlen = MultiByteToWideChar(CP_UTF8, 0, line_start, -1, NULL, 0);
+                                int used_cp = CP_UTF8;
+                                if (wlen <= 0) {
+                                    wlen = MultiByteToWideChar(CP_ACP, 0, line_start, -1, NULL, 0);
+                                    used_cp = CP_ACP;
+                                }
+                                if (wlen > 0) {
+                                    wchar_t *wline = (wchar_t*)malloc(wlen * sizeof(wchar_t));
+                                    if (wline) {
+                                        MultiByteToWideChar(used_cp, 0, line_start, -1, wline, wlen);
+                                        wchar_t *filtered = TranslateConsoleLine(wline);
+                                        free(wline);
+                                        if (filtered) {
+                                            size_t wlen_final = wcslen(filtered) + 3;
+                                            wchar_t *wline_nl = (wchar_t*)malloc(wlen_final * sizeof(wchar_t));
+                                            if (wline_nl) {
+                                                wcscpy_s(wline_nl, wlen_final, filtered);
+                                                wcscat_s(wline_nl, wlen_final, L"\r\n");
+                                                SafePostAllocatedString(postTarget, WM_APPEND_OUTPUT, (WPARAM)p->hEdit, wline_nl);
+                                            }
+                                            free(filtered);
+                                        }
+                                    }
+                                }
+                            }
+                            line_start = line_end + 1;
+                            if (*line_end == '\r' && *(line_end + 1) == '\n') {
+                                line_end++;
+                                line_start++;
+                            }
+                        }
+                        line_end++;
                     }
-                    free(tline);
+                    
+                    // Last line without newline
+                    if (line_start < line_end) {
+                        int wlen = MultiByteToWideChar(CP_UTF8, 0, line_start, -1, NULL, 0);
+                        int used_cp = CP_UTF8;
+                        if (wlen <= 0) {
+                            wlen = MultiByteToWideChar(CP_ACP, 0, line_start, -1, NULL, 0);
+                            used_cp = CP_ACP;
+                        }
+                        if (wlen > 0) {
+                            wchar_t *wline = (wchar_t*)malloc(wlen * sizeof(wchar_t));
+                            if (wline) {
+                                MultiByteToWideChar(used_cp, 0, line_start, -1, wline, wlen);
+                                wchar_t *filtered = TranslateConsoleLine(wline);
+                                free(wline);
+                                if (filtered) {
+                                    size_t wlen_final = wcslen(filtered) + 3;
+                                    wchar_t *wline_nl = (wchar_t*)malloc(wlen_final * sizeof(wchar_t));
+                                    if (wline_nl) {
+                                        wcscpy_s(wline_nl, wlen_final, filtered);
+                                        wcscat_s(wline_nl, wlen_final, L"\r\n");
+                                        SafePostAllocatedString(postTarget, WM_APPEND_OUTPUT, (WPARAM)p->hEdit, wline_nl);
+                                    }
+                                    free(filtered);
+                                }
+                            }
+                        }
+                    }
+                    
+                    free(buffer);
                 }
             }
-            
-            if (eol) {
-                start = eol + 1;
-                // consume \n in case of \r\n
-                if (eol[0] == '\r' && start < end && start[0] == '\n') start++;
-            } else {
-                break;
-            }
+            fclose(read_out);
         }
+        
+        // Clean up temp files
+        DeleteFileA(temp_stdout_path);
+        DeleteFileA(temp_stderr_path);
     }
-    
-    // Clean up
-    // Clean up
-    if (stdout_redirected && redirect.buffer) free(redirect.buffer);
     for (int i = 0; i < argc; ++i) {
         if (argv[i]) free(argv[i]);
         if (wargv[i]) free(wargv[i]);
@@ -1972,202 +2572,6 @@ static DWORD WINAPI IntegratedExecutionThread(LPVOID lpParam) {
     }
 
     return result;
-}
-
-// Old thread proc (kept for reference but now unused)
-static DWORD WINAPI ProcessCaptureThread_OLD(LPVOID lpParam) {
-    PROC_THREAD_PARAM *p = (PROC_THREAD_PARAM*)lpParam;
-    SECURITY_ATTRIBUTES sa = { sizeof(SECURITY_ATTRIBUTES), NULL, TRUE };
-    HANDLE hRead = NULL, hWrite = NULL;
-    if (!CreatePipe(&hRead, &hWrite, &sa, 0)) {
-        free(p);
-        return 1;
-    }
-    // Ensure read handle not inheritable
-    SetHandleInformation(hRead, HANDLE_FLAG_INHERIT, 0);
-
-    STARTUPINFOW si = {0};
-    PROCESS_INFORMATION pi = {0};
-    si.cb = sizeof(si);
-    si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
-    si.hStdOutput = hWrite;
-    si.hStdError = hWrite;
-    si.hStdInput = NULL;
-    si.wShowWindow = SW_HIDE;
-
-    // CreateProcess requires mutable command line
-    wchar_t cmdline[1024];
-    wcscpy(cmdline, p->cmdline);
-
-    /* Build a shortened, more readable command string for display (strip directory paths inside quotes).
-       We also add blank lines around it for visual separation. */
-    {
-        wchar_t shortbuf[2048];
-        int si = 0;
-        int i = 0;
-        /* Extract readable tokens, keeping only filename (no path) inside quotes */
-        while (cmdline[i] && si < (int)sizeof(shortbuf)/sizeof(wchar_t) - 1) {
-            if (cmdline[i] == L'"') {
-                /* copy opening quote */
-                shortbuf[si++] = L'"'; i++;
-                int start = i;
-                while (cmdline[i] && cmdline[i] != L'"') i++;
-                int end = i - 1;
-                /* find last backslash within quoted token */
-                int b = start - 1;
-                for (int j = start; j <= end; ++j) if (cmdline[j] == L'\\' || cmdline[j] == L'/') b = j;
-                int copy_from = (b >= start) ? (b + 1) : start;
-                for (int j = copy_from; j <= end && si < (int)sizeof(shortbuf)/sizeof(wchar_t) - 1; ++j) shortbuf[si++] = cmdline[j];
-                if (cmdline[i] == L'"') i++; /* skip closing quote */
-                shortbuf[si++] = L'"';
-            } else {
-                /* copy other characters (space, flags) */
-                shortbuf[si++] = cmdline[i++];
-            }
-        }
-        shortbuf[si] = 0;
-        /* Build the display string safely using swprintf_s to ensure null-termination */
-        wchar_t *wbuf = (wchar_t*)malloc( (wcslen(shortbuf) + 128) * sizeof(wchar_t) );
-        if (wbuf) {
-            // Use localized prefix for "Execute" messages
-            wchar_t tmp[2048]; _snwprintf(tmp, 2048, tw("exec"), shortbuf);
-            const wchar_t *sep = L"——————————————————————————————————————————————————";
-            // Show a separator line above the command for better readability
-            swprintf_s(wbuf, (int)(wcslen(sep) + wcslen(tmp) + 8), L"%s\r\n%s\r\n\r\n", sep, tmp);
-            PostMessageW(GetForegroundWindow(), WM_APPEND_OUTPUT, (WPARAM)p->hEdit, (LPARAM)wbuf);
-        }
-    }
-
-    BOOL ok = CreateProcessW(NULL, cmdline, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
-    // Close write handle in parent so we can read EOF
-    CloseHandle(hWrite);
-    if (!ok) {
-        wchar_t msgbuf[256];
-            _snwprintf(msgbuf, 256, tw("createprocess_failed"), GetLastError());
-        size_t mlen = wcslen(msgbuf) + 1;
-        wchar_t *wbuf = (wchar_t*)malloc(mlen * sizeof(wchar_t));
-        if (wbuf) wcscpy(wbuf, msgbuf);
-        PostMessageW(GetForegroundWindow(), WM_APPEND_OUTPUT, (WPARAM)p->hEdit, (LPARAM)wbuf);
-        CloseHandle(hRead);
-        free(p);
-        return 1;
-    }
-
-    // Read output and process lines (buffered, to handle partial chunks)
-    CHAR buffer[512];
-    DWORD bytesRead;
-    while (ReadFile(hRead, buffer, sizeof(buffer)-1, &bytesRead, NULL) && bytesRead > 0) {
-        buffer[bytesRead] = 0;
-        // Append to partial buffer (ensure not to overflow)
-        int space = (int)sizeof(p->partial) - p->partial_len - 1;
-        int tocopy = (int)bytesRead;
-        if (tocopy > space) tocopy = space;
-        memcpy(p->partial + p->partial_len, buffer, tocopy);
-        p->partial_len += tocopy;
-        p->partial[p->partial_len] = 0;
-
-        // Process complete lines separated by '\n'
-        char *start = p->partial;
-        char *end = p->partial + p->partial_len;
-        char *nl = NULL;
-        while ((nl = (char*)memchr(start, '\n', end - start))) {
-            size_t linelen = nl - start + 1; // include newline
-            char linebuf[4096];
-            if (linelen >= sizeof(linebuf)) linelen = sizeof(linebuf)-1;
-            memcpy(linebuf, start, linelen);
-            linebuf[linelen] = 0;
-            // Trim trailing CR/LF
-            size_t real_len = linelen;
-            while (real_len > 0 && (linebuf[real_len-1] == '\n' || linebuf[real_len-1] == '\r')) {
-                linebuf[--real_len] = 0;
-            }
-
-            // Convert to wide (try UTF-8 then fallback to ANSI)
-            int wlen = MultiByteToWideChar(CP_UTF8, 0, linebuf, -1, NULL, 0);
-            wchar_t *wline = NULL;
-            if (wlen <= 0) {
-                wlen = MultiByteToWideChar(CP_ACP, 0, linebuf, -1, NULL, 0);
-                if (wlen > 0) {
-                    wline = (wchar_t*)malloc(wlen * sizeof(wchar_t));
-                    MultiByteToWideChar(CP_ACP, 0, linebuf, -1, wline, wlen);
-                }
-            } else {
-                wline = (wchar_t*)malloc(wlen * sizeof(wchar_t));
-                MultiByteToWideChar(CP_UTF8, 0, linebuf, -1, wline, wlen);
-            }
-
-            if (wline) {
-                wchar_t *tline = TranslateConsoleLine(wline);
-                free(wline);
-                if (tline) {
-                    size_t tlen = wcslen(tline);
-                    // Append CRLF for display
-                    wchar_t *wbuf = (wchar_t*)malloc((tlen + 3) * sizeof(wchar_t));
-                    if (wbuf) {
-                        wcscpy(wbuf, tline);
-                        wcscat(wbuf, L"\r\n");
-                        PostMessageW(GetForegroundWindow(), WM_APPEND_OUTPUT, (WPARAM)p->hEdit, (LPARAM)wbuf);
-                    }
-                    free(tline);
-                }
-            }
-
-            start = nl + 1;
-        }
-
-        // Move any remaining partial to the front
-        size_t remaining = end - start;
-        if (remaining > 0) memmove(p->partial, start, remaining);
-        p->partial_len = (int)remaining;
-        p->partial[p->partial_len] = 0;
-    }
-
-    // Process any final partial line after EOF
-    if (p->partial_len > 0) {
-        // treat as one final line
-        char linebuf[4096];
-        int linelen = p->partial_len;
-        if (linelen >= (int)sizeof(linebuf)) linelen = (int)sizeof(linebuf) - 1;
-        memcpy(linebuf, p->partial, linelen);
-        linebuf[linelen] = 0;
-        // convert to wide
-        int wlen = MultiByteToWideChar(CP_UTF8, 0, linebuf, -1, NULL, 0);
-        wchar_t *wline = NULL;
-        if (wlen <= 0) {
-            wlen = MultiByteToWideChar(CP_ACP, 0, linebuf, -1, NULL, 0);
-            if (wlen > 0) {
-                wline = (wchar_t*)malloc(wlen * sizeof(wchar_t));
-                MultiByteToWideChar(CP_ACP, 0, linebuf, -1, wline, wlen);
-            }
-        } else {
-            wline = (wchar_t*)malloc(wlen * sizeof(wchar_t));
-            MultiByteToWideChar(CP_UTF8, 0, linebuf, -1, wline, wlen);
-        }
-        if (wline) {
-            wchar_t *tline = TranslateConsoleLine(wline);
-            free(wline);
-            if (tline) {
-                size_t tlen = wcslen(tline);
-                wchar_t *wbuf = (wchar_t*)malloc((tlen + 3) * sizeof(wchar_t));
-                if (wbuf) {
-                    wcscpy(wbuf, tline);
-                    wcscat(wbuf, L"\r\n");
-                    PostMessageW(GetForegroundWindow(), WM_APPEND_OUTPUT, (WPARAM)p->hEdit, (LPARAM)wbuf);
-                }
-                free(tline);
-            }
-        }
-        p->partial_len = 0;
-        p->partial[0] = 0;
-    }
-
-    // Wait for process to exit
-    WaitForSingleObject(pi.hProcess, INFINITE);
-    CloseHandle(pi.hProcess);
-    CloseHandle(pi.hThread);
-    CloseHandle(hRead);
-    free(p);
-    return 0;
 }
 
 // Use integrated execution instead of external process
@@ -2224,9 +2628,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     static HWND hCrearLblDesc, hCrearEditDesc;
     static HWND hCrearChkUndo, hCrearChkValid, hCrearLblTipo, hCrearComboTipo;
     static HWND hCrearBtnCrear, hCrearBtnShow, hCrearBtnAdd, hCrearBtnClear;
+
     static HWND botones[12] = {0};
     static HWND hCrearOutput;
     static HWND hCrearLblSalida;
+
+    // Los ayudantes de progreso están definidos a nivel de archivo cerca de la parte superior para evitar duplicados.
     // Aplicar Parche controls
     static HWND hAplicarPanel = NULL;
     static HWND hAplicarLblImg, hAplicarEditImg, hAplicarBtnImg;
@@ -2260,6 +2667,59 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (hCrearBtnDIZ) EnableWindow(hCrearBtnDIZ, enable);
         if (hAplicarBtnImg) EnableWindow(hAplicarBtnImg, enable);
         if (hAplicarBtnPPF) EnableWindow(hAplicarBtnPPF, enable);
+        return 0;
+    }
+    case WM_CREAR_PROGRESS: {
+        // wParam: entero 0..10000 representando percent*100
+        int ipct = (int)wParam;
+        if (ipct <= 0) {
+            // resetear a cero y mostrar barra no interactiva
+            CrearProgress_ResetToZero();
+        } else {
+            // actualizar al porcentaje provisto y mostrar barra no interactiva
+            CrearProgress_SetPos(ipct);
+        }
+        return 0;
+    }
+    case WM_APLICAR_PROGRESS: {
+        // wParam: entero 0..10000 representando percent*100
+        // Asegurar que el control exista incluso si el panel no se ha redimensionado aún
+        if (!g_hAplicarTopProgress && g_hAplicarPanel) {
+            // force creation using the same layout logic as WM_SIZE
+            RECT rcAplicar;
+            GetClientRect(g_hAplicarPanel, &rcAplicar);
+            int apanelW = rcAplicar.right;
+            int axlbl = ScaleForWindow(g_hAplicarPanel, 20);
+            int gap = ScaleForWindow(g_hAplicarPanel, 7);
+            int h_local = ScaleForWindow(g_hAplicarPanel, 22);
+            int y_local = ScaleForWindow(g_hAplicarPanel, 10) + h_local + gap; // position below first row
+            int progW = ScaleForWindow(g_hAplicarPanel, 475);
+            int progH = ScaleForWindow(g_hAplicarPanel, 12);
+            int progX = axlbl;
+            int marginRight = ScaleForWindow(g_hAplicarPanel, 20);
+            if (progX + progW > apanelW - marginRight) progW = apanelW - marginRight - progX;
+            if (progW < ScaleForWindow(g_hAplicarPanel, 40)) progW = ScaleForWindow(g_hAplicarPanel, 40);
+            int progY = y_local - ScaleForWindow(g_hAplicarPanel, 4);
+            g_hAplicarTopProgress = CreateWindowExW(0, L"msctls_progress32", NULL, WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS,
+                                progX, progY, progW, progH, g_hAplicarPanel, (HMENU)152, NULL, NULL);
+            if (g_hAplicarTopProgress) {
+                SendMessageW(g_hAplicarTopProgress, PBM_SETRANGE32, 0, 10000);
+                SendMessageW(g_hAplicarTopProgress, PBM_SETSTEP, 1, 0);
+                SendMessageW(g_hAplicarTopProgress, PBM_SETPOS, 0, 0);
+                SetWindowTheme(g_hAplicarTopProgress, L"Explorer", L"Explorer");
+                EnableWindow(g_hAplicarTopProgress, FALSE);
+                ShowWindow(g_hAplicarTopProgress, SW_SHOWNOACTIVATE);
+                SetWindowPos(g_hAplicarTopProgress, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+            }
+        }
+        int ipct = (int)wParam;
+        if (ipct <= 0) {
+            // resetear a cero y mostrar barra no interactiva
+            AplicarProgress_ResetToZero();
+        } else {
+            // actualizar al porcentaje provisto y mostrar barra no interactiva
+            AplicarProgress_SetPos(ipct);
+        }
         return 0;
     }
     case WM_MOUSEWHEEL: {
@@ -2347,6 +2807,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         AppendMenuW(hMenuIdioma, MF_STRING, 302, T(L"menu_en"));
         AppendMenuW(hMenuTema, MF_STRING, 203, T(L"menu_dark"));
         AppendMenuW(hMenuTema, MF_STRING, 204, T(L"menu_light"));
+        AppendMenuW(hMenuAyuda, MF_STRING, 205, T(L"menu_help_show"));
         AppendMenuW(hMenuAyuda, MF_STRING, 206, T(L"menu_about"));
         RECT rcClient;
         GetClientRect(hwnd, &rcClient);
@@ -2363,6 +2824,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         tie.pszText = (LPWSTR)T(L"tab_apply");
         TabCtrl_InsertItem(hwndTab, 1, &tie);
         SendMessageW(hwndTab, WM_SETFONT, (WPARAM)hFont, TRUE);
+
 
         RECT rcTab;
         GetClientRect(hwndTab, &rcTab);
@@ -2382,15 +2844,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         UpdateThemeMenuChecks(hMenuBar, g_isDark);
         DrawMenuBar(hwnd);
         // alturas ligeramente mayores para centrar texto y dar más respiro visual (escaladas por DPI)
-        int dpiLocalLayout = GetWindowDPI(hwnd);
         int y = ScaleForWindow(hwnd, 15);
-        int xlbl = ScaleForWindow(hwnd, 24);
+        int xlbl = ScaleForWindow(hwnd, 26);
         int xbtn = ScaleForWindow(hwnd, 520);
         int wlbl = ScaleForWindow(hwnd, 150);
-        int wbtn = ScaleForWindow(hwnd, 32);
-        int h = ScaleForWindow(hwnd, 26);
-        int hBtn = ScaleForWindow(hwnd, 32);
-        int hBrowse = ScaleForWindow(hwnd, 26);
+        int wbtn = ScaleForWindow(hwnd, 426);
+        int h = ScaleForWindow(hwnd, 26); // altura de controles edit y labels
+        int hBtn = ScaleForWindow(hwnd, 326);
+        int hBrowse = ScaleForWindow(hwnd, 26); // altura botones "..."
         int sep = ScaleForWindow(hwnd, 12);
         int spcBeforeButtonsScaled = ScaleForWindow(hwnd, spcBeforeButtons);
 
@@ -2442,7 +2903,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             xedit, y, wedit, h, hCrearPanel, (HMENU)103, NULL, NULL);
         hCrearBtnPPF = CreateWindowW(L"BUTTON", L"...", BTN_STYLE,
             xbtn, y, wbtn, hBrowse, hCrearPanel, (HMENU)113, NULL, NULL);
-        y += h + sep + ScaleForWindow(hwnd,10); // espacio extra entre PPF destino y file_id.diz
+        y += h + sep + ScaleForWindow(hwnd,10); // espacio entre archivo PPF y DIZ
 
         hCrearLblDIZ = CreateWindowW(L"STATIC", T(L"lbl_diz"), WS_CHILD | WS_VISIBLE,
             xlbl, y + ScaleForWindow(hwnd,3), wlbl, h, hCrearPanel, NULL, NULL, NULL);
@@ -2456,6 +2917,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             xlbl, y + ScaleForWindow(hwnd,3), wlbl, h, hCrearPanel, NULL, NULL, NULL);
         hCrearEditDesc = CreateWindowW(L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
             xedit, y, wedit, h, hCrearPanel, (HMENU)105, NULL, NULL);
+        SendMessageW(hCrearEditDesc, EM_LIMITTEXT, (WPARAM)50, 0);
         y += h + sep;
 
         hCrearChkUndo = CreateWindowW(L"BUTTON", T(L"chk_undo"), CHK_STYLE,
@@ -2511,6 +2973,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         GetWindowTextW(hCrearBtnClear, btnTxt, 128);
         btnW = GetTextWidthInPixels(hCrearPanel, hFont, btnTxt) + btnMargin;
         MoveWindow(hCrearBtnClear, btnX, y, btnW, hBtn, TRUE);
+
         y += hBtn + sep + spcBeforeButtonsScaled;
 
         hCrearOutput = CreateWindowW(L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY,
@@ -2554,7 +3017,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         
         // Ajustar ancho de botones al texto
         wchar_t btnTxt2[128];
-        int btnMargin2 = 20;
         int btnX2 = xlbl;
         
         GetWindowTextW(hAplicarBtnApply, btnTxt2, 128);
@@ -2580,14 +3042,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         // Asegurar fuente en todos los controles nuevos
         HWND aplicarControles[] = {hAplicarLblImg, hAplicarEditImg, hAplicarBtnImg, hAplicarLblPPF, hAplicarEditPPF, hAplicarBtnPPF,
             hAplicarChkRevert, hAplicarBtnApply, hAplicarBtnClear, hAplicarLblSalida, hAplicarOutput};
-        for (int i = 0; i < sizeof(aplicarControles)/sizeof(HWND); ++i) {
+        for (size_t i = 0; i < sizeof(aplicarControles)/sizeof(HWND); ++i) {
             SendMessageW(aplicarControles[i], WM_SETFONT, (WPARAM)hFont, TRUE);
             ApplyTheme(aplicarControles[i]);
         }
         HWND crearControles[] = {hCrearLblImg, hCrearEditImg, hCrearBtnImg, hCrearLblMod, hCrearEditMod, hCrearBtnMod,
             hCrearLblPPF, hCrearEditPPF, hCrearBtnPPF, hCrearLblDIZ, hCrearEditDIZ, hCrearBtnDIZ, hCrearLblDesc, hCrearEditDesc,
             hCrearChkUndo, hCrearChkValid, hCrearLblTipo, hCrearComboTipo, hCrearBtnCrear, hCrearBtnShow, hCrearBtnAdd, hCrearBtnClear, hCrearOutput};
-        for (int i = 0; i < sizeof(crearControles)/sizeof(HWND); ++i) {
+        for (size_t i = 0; i < sizeof(crearControles)/sizeof(HWND); ++i) {
             SendMessageW(crearControles[i], WM_SETFONT, (WPARAM)hFont, TRUE);
             ApplyTheme(crearControles[i]);
         }
@@ -2630,6 +3092,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             GetClientRect(hwnd, &rcClient);
             int margin = ScaleForWindow(hwnd, 6);
             MoveWindow(hwndTab, margin, margin, rcClient.right - (margin * 2), rcClient.bottom - (margin * 2), TRUE);
+
             RECT rcTab;
             GetClientRect(hwndTab, &rcTab);
             TabCtrl_AdjustRect(hwndTab, FALSE, &rcTab);
@@ -2642,13 +3105,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             RECT rcPanel;
             GetClientRect(hCrearPanel, &rcPanel);
             int panelW = rcPanel.right;
-            /* Use DPI-scaled layout metrics so controls remain usable at high DPI
-               Scale values with the panel window so they follow its DPI context */
+            // Usar métricas de layout escaladas por DPI para que los controles sigan siendo usables en DPI altos
             int marginRight = ScaleForWindow(hCrearPanel, 20);
             int xlbl_local = ScaleForWindow(hCrearPanel, 20);
-            int gap = ScaleForWindow(hCrearPanel, 10);
-            int wbtn_local = ScaleForWindow(hCrearPanel, 32);
-            int h_browse = ScaleForWindow(hCrearPanel, 24);
+            int gap = ScaleForWindow(hCrearPanel, 7);
+            int wbtn_local = ScaleForWindow(hCrearPanel, 28); // ancho botones examinar
+            int h_browse = ScaleForWindow(hCrearPanel, 22); // altura botones examinar
             int labelToEditGap = ScaleForWindow(hCrearPanel, 0);
             // Compute the label width from the actual longest label text (across both tabs) so edit fields start closer
             int wlbl_local = ScaleForWindow(hCrearPanel, 150);
@@ -2668,8 +3130,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             }
             int xedit_local = xlbl_local + wlbl_local + labelToEditGap;
             int y_local = ScaleForWindow(hCrearPanel, 10);
-            int h_local = ScaleForWindow(hCrearPanel, 24);
-            int h_action = ScaleForWindow(hCrearPanel, 30); // taller buttons for primary actions
+            int h_local = ScaleForWindow(hCrearPanel, 22); // altura campos superiores de texto, imagen original...
+            int h_action = ScaleForWindow(hCrearPanel, 24); // Botones superiores agregar imagenes...
 
             // helper macro-like local motions
             if (hCrearLblImg && hCrearEditImg && hCrearBtnImg) {
@@ -2695,7 +3157,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 MoveWindow(hCrearLblPPF, xlbl_local, y_local + 3, wlbl_local, h_local, TRUE);
                 MoveWindow(hCrearEditPPF, xedit_local, y_local, wedit, h_local, TRUE);
                 MoveWindow(hCrearBtnPPF, xbtn, y_local, wbtn_local, h_browse, TRUE);
-                y_local += h_local + gap + 10; // espacio extra
+                y_local += h_local + gap + 10; // espacio entre archivo PPF y DIZ
             }
             if (hCrearLblDIZ && hCrearEditDIZ && hCrearBtnDIZ) {
                 int xbtn = panelW - marginRight - wbtn_local;
@@ -2712,34 +3174,72 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 y_local += h_local + gap;
             }
             if (hCrearChkUndo && hCrearChkValid && hCrearComboTipo) {
-                /* Place the BIN/GI combo directly after the 'Activar validación' checkbox
-                   and use DPI-scaled widths so nothing gets clipped. */
+                // Colocar el combo BIN/GI directamente después del checkbox 'Activar validación'
+                // y usar anchuras escaladas por DPI para que nada se recorte.
                 int wcombo = ScaleForWindow(hCrearPanel, 70);
                 int chk_undo_w = ScaleForWindow(hCrearPanel, 170);
                 int chk_valid_w = ScaleForWindow(hCrearPanel, 140);
-                int chk_gap = ScaleForWindow(hCrearPanel, 20); /* gap between checkboxes */
-                int lbl_tipo_w = ScaleForWindow(hCrearPanel, 50);
-                int small_gap = ScaleForWindow(hCrearPanel, 6);
+                int chk_gap = ScaleForWindow(hCrearPanel, 20); // separación entre checkboxes
 
-                /* place checkboxes starting at left */
+                // colocar los checkboxes empezando desde la izquierda
                 MoveWindow(hCrearChkUndo, xlbl_local, y_local, chk_undo_w, h_local, TRUE);
                 MoveWindow(hCrearChkValid, xlbl_local + chk_undo_w + chk_gap, y_local, chk_valid_w, h_local, TRUE);
 
-                /* Position the label and combo using fixed (scaled) offsets so they align like the original layout */
+                // Posicionar la etiqueta y el combo usando offsets fijos (escalados) para que se alineen como el diseño original
                 int lbl_left = xlbl_local + ScaleForWindow(hCrearPanel, 350);
                 int combo_left = xlbl_local + ScaleForWindow(hCrearPanel, 405);
                 MoveWindow(hCrearLblTipo, lbl_left, y_local + 3, ScaleForWindow(hCrearPanel,50), h_local, TRUE);
                 MoveWindow(hCrearComboTipo, combo_left, y_local, wcombo, h_local * 6, TRUE);
 
-                y_local += h_local + gap + spcBeforeButtons;
-            }
-            if (hCrearLblSalida) {
-                MoveWindow(hCrearLblSalida, xlbl_local, y_local, ScaleForWindow(hCrearPanel,60), h_local, TRUE);
-                y_local += h_local + 4;
+                // Crear o mover el control de progreso de la pestaña Crear colocado inmediatamente bajo la fila de checkboxes
+                {
+                    int progW = ScaleForWindow(hCrearPanel, 475);
+                    int progH = ScaleForWindow(hCrearPanel, 12);
+                    RECT rcCombo;
+                    GetWindowRect(hCrearComboTipo, &rcCombo);
+                    MapWindowPoints(NULL, hCrearPanel, (LPPOINT)&rcCombo, 2);
+                    int progX = xlbl_local; // alinear a la izquierda con las etiquetas para una apariencia ordenada
+                    // Limitar ancho para que quepa dentro del panel
+                    if (progX + progW > panelW - marginRight) progW = panelW - marginRight - progX;
+                    if (progW < ScaleForWindow(hCrearPanel, 40)) progW = ScaleForWindow(hCrearPanel, 40); // ancho mínimo
+                    // Espacio superior de la barra de progreso y línea superior
+                    int progY = y_local + h_local + ScaleForWindow(hCrearPanel, 6);
+                    if (!g_hCrearTopProgress) {
+                        g_hCrearTopProgress = CreateWindowExW(0, L"msctls_progress32", NULL, WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS,
+                            progX, progY, progW, progH, hCrearPanel, (HMENU)151, NULL, NULL);
+                        if (g_hCrearTopProgress) {
+                            SendMessageW(g_hCrearTopProgress, PBM_SETRANGE32, 0, 10000);
+                            SendMessageW(g_hCrearTopProgress, PBM_SETSTEP, 1, 0);
+                            SendMessageW(g_hCrearTopProgress, PBM_SETPOS, 0, 0);
+                            SetWindowTheme(g_hCrearTopProgress, L"Explorer", L"Explorer");
+                            // Mantener control deshabilitado para que no capture clics del ratón en caso de solapamiento
+                            EnableWindow(g_hCrearTopProgress, FALSE);
+                            ShowWindow(g_hCrearTopProgress, SW_SHOWNOACTIVATE);
+                            SetWindowPos(g_hCrearTopProgress, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+                        } else {
+                            // Fallo en creación: registrar en la edición de salida
+                            wchar_t *err = _wcsdup(L"Warning: failed to create g_hCrearTopProgress\r\n");
+                            if (err) SafePostAllocatedString(g_hwndMain ? g_hwndMain : GetForegroundWindow(), WM_APPEND_OUTPUT, (WPARAM)g_hCrearOutput, err);
+                        }
+                    } else {
+                        MoveWindow(g_hCrearTopProgress, progX, progY, progW, progH, TRUE);
+                        // Asegurar que no capture clics
+                        ShowWindow(g_hCrearTopProgress, SW_SHOWNOACTIVATE);
+                        EnableWindow(g_hCrearTopProgress, FALSE);
+                        SetWindowPos(g_hCrearTopProgress, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+                    }
+                }
+
+                // Añadir espaciado igual a la altura del checkbox + altura de progreso + pequeño hueco para separar de botones
+                {
+                    int prog_h_local = ScaleForWindow(hCrearPanel, 14);
+                    int gap_after = ScaleForWindow(hCrearPanel, 10); // espacio inferior de la barra de progreso
+                    // Avanzar pasado la fila de checkboxes + progreso + hueco
+                    y_local += h_local + prog_h_local + gap_after;
+                }
             }
             if (hCrearBtnCrear && hCrearBtnShow && hCrearBtnAdd && hCrearBtnClear) {
                 // Ajustar ancho de botones al texto — usar exactamente la misma referencia y constantes que en la pestaña Aplicar
-                int btnMargin = 20;
                 int btnX = xlbl_local;
                 wchar_t btnTxt[128];
                 HWND hwndRefForMeasure = hAplicarPanel ? hAplicarPanel : hCrearPanel;
@@ -2766,12 +3266,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             }
             if (hCrearLblSalida) {
                 MoveWindow(hCrearLblSalida, xlbl_local, y_local, 60, h_local, TRUE);
-                y_local += h_local + 4;
+                y_local += h_local + ScaleForWindow(hCrearPanel, 4);
             }
             if (hCrearOutput) {
                 int outW = panelW - xlbl_local - marginRight;
-                int outH = rcPanel.bottom - y_local - 10; // expandir hasta abajo con margen
-                if (outH < 80) outH = 80;
+                int outH = rcPanel.bottom - y_local - ScaleForWindow(hCrearPanel, 10); // expandir hasta abajo con margen
                 MoveWindow(hCrearOutput, xlbl_local, y_local, outW, outH, TRUE);
             }
 
@@ -2811,6 +3310,50 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     MoveWindow(hAplicarChkRevert, axlbl, ay_local, revert_w, h_local, TRUE);
                     ay_local += h_local + gap + spcBeforeButtons;
 
+                    // Create or move Apply-tab progress control placed immediately under the checkbox
+                    {
+                        int progW = ScaleForWindow(hAplicarPanel, 475);
+                        int progH = ScaleForWindow(hAplicarPanel, 12);
+                        int progX = axlbl; // Alinear a la izquierda con las etiquetas para una apariencia ordenada
+                        // Limitar ancho para que quepa dentro del panel
+                        if (progX + progW > apanelW - marginRight) progW = apanelW - marginRight - progX;
+                        if (progW < ScaleForWindow(hAplicarPanel, 40)) progW = ScaleForWindow(hAplicarPanel, 40); // ancho mínimo
+                        // Espacio superior de la barra de progreso y línea superior
+                        int progY = ay_local - ScaleForWindow(hAplicarPanel, 4);
+                        if (!g_hAplicarTopProgress) {
+                            g_hAplicarTopProgress = CreateWindowExW(0, L"msctls_progress32", NULL, WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS,
+                                progX, progY, progW, progH, hAplicarPanel, (HMENU)152, NULL, NULL);
+                            if (g_hAplicarTopProgress) {
+                                SendMessageW(g_hAplicarTopProgress, PBM_SETRANGE32, 0, 10000);
+                                SendMessageW(g_hAplicarTopProgress, PBM_SETSTEP, 1, 0);
+                                SendMessageW(g_hAplicarTopProgress, PBM_SETPOS, 0, 0);
+                                SetWindowTheme(g_hAplicarTopProgress, L"Explorer", L"Explorer");
+                                // Mantener control deshabilitado para que no capture clics del ratón en caso de solapamiento
+                                EnableWindow(g_hAplicarTopProgress, FALSE);
+                                ShowWindow(g_hAplicarTopProgress, SW_SHOWNOACTIVATE);
+                                SetWindowPos(g_hAplicarTopProgress, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+                            } else {
+                                // Fallo en creación: registrar en la edición de salida
+                                wchar_t *err = _wcsdup(L"Warning: failed to create g_hAplicarTopProgress\r\n");
+                                if (err) SafePostAllocatedString(g_hwndMain ? g_hwndMain : GetForegroundWindow(), WM_APPEND_OUTPUT, (WPARAM)hAplicarOutput, err);
+                            }
+                        } else {
+                            MoveWindow(g_hAplicarTopProgress, progX, progY, progW, progH, TRUE);
+                            // Asegurar que no capture clics
+                            ShowWindow(g_hAplicarTopProgress, SW_SHOWNOACTIVATE);
+                            EnableWindow(g_hAplicarTopProgress, FALSE);
+                            SetWindowPos(g_hAplicarTopProgress, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+                        }
+                    }
+
+                    // Añadir espaciado igual a la altura de progreso + pequeño hueco para separar de botones
+                    {
+                        int prog_h_local = ScaleForWindow(hAplicarPanel, 14);
+                        int gap_after = ScaleForWindow(hAplicarPanel, 10);
+                        // Avanzar pasado progreso + hueco
+                        ay_local += prog_h_local + gap_after;
+                    }
+
                     // Ajustar ancho de botones al texto
                     int btnMargin2 = ScaleForWindow(hAplicarPanel, 20);
                     int btnX2 = axlbl;
@@ -2833,7 +3376,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 if (hAplicarOutput) {
                     int aoutW = apanelW - axlbl - marginRight;
                     int aoutH = rcAplicar.bottom - ay_local - ScaleForWindow(hAplicarPanel,10);
-                    if (aoutH < ScaleForWindow(hAplicarPanel,80)) aoutH = ScaleForWindow(hAplicarPanel,80);
                     MoveWindow(hAplicarOutput, axlbl, ay_local, aoutW, aoutH, TRUE);
                 }
             }
@@ -2938,6 +3480,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case 206: // About
             ShowAboutDialog(hwnd);
             break;
+        case 205: // Help
+            ShowHelpDialog(hwnd);
+            break;
         case 207: // Show help (console help shown in GUI)
             MessageBoxW(hwnd, tw("console_help"), T(L"menu_help"), MB_OK | MB_ICONINFORMATION);
             break;
@@ -2956,12 +3501,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             ofn.lpstrFile = filename;
             ofn.nMaxFile = MAX_PATH;
             ofn.Flags = OFN_PATHMUSTEXIST | OFN_HIDEREADONLY | OFN_EXPLORER;
-            // choose dialog type and filter
-            if (id == 113) {
-                // Save PPF (do not prompt on overwrite — auto-overwrite)
-                {
-                    static wchar_t filter[256];
-                    memset(filter, 0, sizeof(filter));
+            DWORD flags = (id == 113) ? 0 : OFN_FILEMUSTEXIST;
+            HWND hTarget = (id == 113) ? hCrearEditPPF : (id == 111) ? hCrearEditImg : (id == 112) ? hCrearEditMod : (id == 114) ? hCrearEditDIZ : NULL;
+            // unified dialog: set filter according to control id
+            {
+                static wchar_t filter[256];
+                memset(filter, 0, sizeof(filter));
+                if (id == 113) {
+                    // PPF save
                     wcscpy(filter, tw("filter_ppf"));
                     size_t pos = wcslen(filter) + 1;
                     wcscpy(&filter[pos], L"*.ppf");
@@ -2970,117 +3517,79 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     pos += wcslen(&filter[pos]) + 1;
                     wcscpy(&filter[pos], L"*.*");
                     size_t finalPos = pos + wcslen(&filter[pos]) + 1;
-                    if (finalPos + 1 < sizeof(filter)/sizeof(wchar_t)) {
-                        filter[finalPos] = L'\0';
-                        filter[finalPos+1] = L'\0';
-                    }
-                    ofn.lpstrFilter = filter;
+                    if (finalPos + 1 < sizeof(filter)/sizeof(wchar_t)) { filter[finalPos] = L'\0'; filter[finalPos+1] = L'\0'; }
+                } else if (id == 111 || id == 112) {
+                    // image files
+                    wcscpy(filter, tw("filter_images"));
+                    size_t pos = wcslen(filter) + 1;
+                    wcscpy(&filter[pos], L"*.bin;*.gi;*.iso");
+                    pos += wcslen(&filter[pos]) + 1;
+                    wcscpy(&filter[pos], tw("filter_all"));
+                    pos += wcslen(&filter[pos]) + 1;
+                    wcscpy(&filter[pos], L"*.*");
+                    size_t finalPos = pos + wcslen(&filter[pos]) + 1;
+                    if (finalPos + 1 < sizeof(filter)/sizeof(wchar_t)) { filter[finalPos] = L'\0'; filter[finalPos+1] = L'\0'; }
+                } else if (id == 114) {
+                    // diz file
+                    wcscpy(filter, tw("filter_diz"));
+                    size_t pos = wcslen(filter) + 1;
+                    wcscpy(&filter[pos], L"*.diz");
+                    pos += wcslen(&filter[pos]) + 1;
+                    wcscpy(&filter[pos], tw("filter_all"));
+                    pos += wcslen(&filter[pos]) + 1;
+                    wcscpy(&filter[pos], L"*.*");
+                    size_t finalPos = pos + wcslen(&filter[pos]) + 1;
+                    if (finalPos + 1 < sizeof(filter)/sizeof(wchar_t)) { filter[finalPos] = L'\0'; filter[finalPos+1] = L'\0'; }
+                } else {
+                    // fallback all files
+                    wcscpy(filter, tw("filter_all"));
+                    size_t pos = wcslen(filter) + 1;
+                    wcscpy(&filter[pos], L"*.*");
+                    size_t finalPos = pos + wcslen(&filter[pos]) + 1;
+                    if (finalPos + 1 < sizeof(filter)/sizeof(wchar_t)) { filter[finalPos] = L'\0'; filter[finalPos+1] = L'\0'; }
                 }
-                // initial dir from current edit if present
-                BOOL hasInitialDir = FALSE;
-                if (GetWindowTextW(hCrearEditPPF, initialDir, MAX_PATH) && wcslen(initialDir) > 0) {
+                ofn.lpstrFilter = filter;
+
+                // initial dir from target if present
+                if (hTarget && GetWindowTextW(hTarget, initialDir, MAX_PATH) && wcslen(initialDir) > 0) {
                     GetParentFolder(initialDir, initialDir, MAX_PATH);
                     ofn.lpstrInitialDir = initialDir;
-                    hasInitialDir = TRUE;
                 } else {
                     // Use executable dir
                     static wchar_t exeDir[MAX_PATH] = {0};
                     GetExecutableDirectory(exeDir, MAX_PATH);
                     ofn.lpstrInitialDir = exeDir;
                 }
-                // Prefer COM dialog (better initial folder handling); if it fails, fall back to classic dialog.
+
+                // Use modern COM dialog
                 {
                     HRESULT hrDlg = S_OK;
-                    if (ShowSaveFileDialog_COM(hwnd, filename, MAX_PATH, ofn.lpstrInitialDir, ofn.lpstrFilter, &hrDlg)) {
-                        if (hCrearEditPPF) SetWindowTextW(hCrearEditPPF, filename);
-                    } else if (hrDlg != HRESULT_FROM_WIN32(ERROR_CANCELLED)) {
-                        if (GetSaveFileNameW(&ofn)) {
-                            if (hCrearEditPPF) SetWindowTextW(hCrearEditPPF, filename);
+                    if (ShowSaveFileDialog_COM(hwnd, filename, MAX_PATH, ofn.lpstrInitialDir, ofn.lpstrFilter, &hrDlg, flags)) {
+                        if (hTarget) {
+                            // si es el cuadro de PPF, añadir sufijo si falta
+                            if (id == 113) {
+                                wchar_t *dot = wcsrchr(filename, L'.');
+                                if (!dot || _wcsicmp(dot, L".ppf") != 0) {
+                                    wcscat(filename, L".ppf");
+                                }
+                            }
+                            SetWindowTextAndScroll(hTarget, filename);
                         }
-                    }
-                }
-            } else {
-                ofn.Flags |= OFN_FILEMUSTEXIST;
-                HWND hTarget = NULL;
-                if (id == 111) hTarget = hCrearEditImg;
-                else if (id == 112) hTarget = hCrearEditMod;
-                else if (id == 114) hTarget = hCrearEditDIZ;
-                // Set filter according to control: images -> files, diz -> DIZ, fallback -> All files
-                {
-                    static wchar_t filter[256];
-                    const wchar_t *lbl_files = tw("filter_files");
-                    const wchar_t *lbl_all = tw("filter_all");
-                    const wchar_t *lbl_diz = tw("filter_diz");
-                    if (id == 111 || id == 112) {
-                        memset(filter, 0, sizeof(filter));
-                        wcscpy(filter, lbl_files);
-                        size_t pos = wcslen(filter) + 1;
-                        wcscpy(&filter[pos], L"*.bin;*.gi;*.iso");
-                        pos += wcslen(&filter[pos]) + 1;
-                        wcscpy(&filter[pos], lbl_all);
-                        pos += wcslen(&filter[pos]) + 1;
-                        wcscpy(&filter[pos], L"*.*");
-                        size_t finalPos = pos + wcslen(&filter[pos]) + 1;
-                        if (finalPos + 1 < sizeof(filter)/sizeof(wchar_t)) { filter[finalPos] = L'\0'; filter[finalPos+1] = L'\0'; }
-                        ofn.lpstrFilter = filter;
-                    } else if (id == 114) {
-                        memset(filter, 0, sizeof(filter));
-                        wcscpy(filter, lbl_diz);
-                        size_t pos = wcslen(filter) + 1;
-                        wcscpy(&filter[pos], L"*.diz");
-                        pos += wcslen(&filter[pos]) + 1;
-                        wcscpy(&filter[pos], lbl_all);
-                        pos += wcslen(&filter[pos]) + 1;
-                        wcscpy(&filter[pos], L"*.*");
-                        size_t finalPos = pos + wcslen(&filter[pos]) + 1;
-                        if (finalPos + 1 < sizeof(filter)/sizeof(wchar_t)) { filter[finalPos] = L'\0'; filter[finalPos+1] = L'\0'; }
-                        ofn.lpstrFilter = filter;
-                    } else {
-                        memset(filter, 0, sizeof(filter));
-                        wcscpy(filter, lbl_all);
-                        size_t pos = wcslen(filter) + 1;
-                        wcscpy(&filter[pos], L"*.*");
-                        size_t finalPos = pos + wcslen(&filter[pos]) + 1;
-                        if (finalPos + 1 < sizeof(filter)/sizeof(wchar_t)) { filter[finalPos] = L'\0'; filter[finalPos+1] = L'\0'; }
-                        ofn.lpstrFilter = filter;
-                    }
-                }
-                // initial dir from target if present
-                BOOL hasInitialDir = FALSE;
-                if (hTarget && GetWindowTextW(hTarget, initialDir, MAX_PATH) && wcslen(initialDir) > 0) {
-                    GetParentFolder(initialDir, initialDir, MAX_PATH);
-                    ofn.lpstrInitialDir = initialDir;
-                    hasInitialDir = TRUE;
-                } else {
-                    // Use executable dir
-                    static wchar_t exeDir2[MAX_PATH] = {0};
-                    GetExecutableDirectory(exeDir2, MAX_PATH);
-                    ofn.lpstrInitialDir = exeDir2;
-                }
-                // Prefer COM dialog; if it fails, fall back to classic dialog.
-                HRESULT hrDlg = S_OK;
-                BOOL ok = ShowOpenFileDialog_COM(hwnd, filename, MAX_PATH, ofn.lpstrInitialDir, ofn.lpstrFilter, &hrDlg);
-                if (!ok && hrDlg != HRESULT_FROM_WIN32(ERROR_CANCELLED)) {
-                    ok = GetOpenFileNameW(&ofn);
-                }
-                if (ok) {
-                    if (hTarget) {
-                        SetWindowTextW(hTarget, filename);
-                        // If selecting original image in 'Crear', auto-select ISO if filename ends with .iso
+                        // Si se seleccionó la imagen original en 'Crear', auto-seleccionar ISO si termina en .iso
                         if (id == 111) MaybeSetImageTypeFromPath(hCrearComboTipo, hCrearChkValid, filename);
-                    }
-                    // If user selected the original image in 'Crear', auto-fill PPF filename if empty
-                    if (id == 111 && hCrearEditPPF) {
-                        wchar_t curppf[MAX_PATH] = {0};
-                        GetWindowTextW(hCrearEditPPF, curppf, MAX_PATH);
-                        if (wcslen(curppf) == 0) {
-                            // build ppf path by replacing extension with .ppf
-                            wchar_t ppfpath[MAX_PATH];
-                            wcscpy(ppfpath, filename);
-                            wchar_t *dot = wcsrchr(ppfpath, L'.');
-                            if (dot) *dot = 0; // remove extension
-                            wcscat(ppfpath, L".ppf");
-                            SetWindowTextW(hCrearEditPPF, ppfpath);
+                        // Si el usuario seleccionó imagen original en 'Crear', rellenar nombre PPF si está vacío
+                        if (id == 111 && hCrearEditPPF) {
+                            wchar_t curppf[MAX_PATH] = {0};
+                            GetWindowTextW(hCrearEditPPF, curppf, MAX_PATH);
+                            if (wcslen(curppf) == 0) {
+                                // construir ruta ppf reemplazando extensión por .ppf
+                                wchar_t ppfpath[MAX_PATH];
+                                wcscpy(ppfpath, filename);
+                                wchar_t *dot = wcsrchr(ppfpath, L'.');
+                                if (dot) *dot = L'\0';
+                                wcscat(ppfpath, L".ppf");
+                                SetWindowTextAndScroll(hCrearEditPPF, ppfpath);
+                            }
                         }
                     }
                 }
@@ -3114,7 +3623,16 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 wchar_t origname[MAX_PATH] = {0}, modname[MAX_PATH] = {0}, ppfname[MAX_PATH] = {0};
                 if (hCrearEditImg) GetWindowTextW(hCrearEditImg, origname, MAX_PATH);
                 if (hCrearEditMod) GetWindowTextW(hCrearEditMod, modname, MAX_PATH);
-                if (hCrearEditPPF) GetWindowTextW(hCrearEditPPF, ppfname, MAX_PATH);
+                if (hCrearEditPPF) {
+                    GetWindowTextW(hCrearEditPPF, ppfname, MAX_PATH);
+                    if (wcslen(ppfname) > 0) {
+                        wchar_t *dot = wcsrchr(ppfname, L'.');
+                        if (!dot || _wcsicmp(dot, L".ppf") != 0) {
+                            wcscat(ppfname, L".ppf");
+                            SetWindowTextW(hCrearEditPPF, ppfname);
+                        }
+                    }
+                }
                 if (wcslen(origname) == 0 || wcslen(modname) == 0 || wcslen(ppfname) == 0) {
                     if (wcslen(origname) == 0) AppendTextToEdit(hCrearOutput, tw("select_create_origname"));
                     if (wcslen(modname) == 0) AppendTextToEdit(hCrearOutput, tw("select_create_modname"));
@@ -3128,7 +3646,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             SaveSettings(hCrearEditImg, hCrearEditMod, hCrearEditPPF, hCrearEditDIZ, hCrearEditDesc, hCrearChkUndo, hCrearChkValid, hCrearComboTipo,
                          hAplicarEditImg, hAplicarEditPPF, hAplicarChkRevert);
             HANDLE hThread = CreateThread(NULL, 0, ProcessCaptureThread, p, 0, NULL);
-            if (hThread) CloseHandle(hThread); /* CRITICAL: Close thread handle to prevent leak */
+            if (hThread) CloseHandle(hThread); // CRÍTICO: cerrar handle del hilo para prevenir fugas
             break;
         }
         case 132: // Ver Info Parche (show)
@@ -3143,14 +3661,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (hCrearEditPPF && GetWindowTextW(hCrearEditPPF, buf, MAX_PATH) && wcslen(buf) > 0) {
                 AppendQuotedArg(p->cmdline, sizeof(p->cmdline)/sizeof(wchar_t), buf);
                 HANDLE hThread = CreateThread(NULL, 0, ProcessCaptureThread, p, 0, NULL);
-                if (hThread) CloseHandle(hThread); /* CRITICAL: Close thread handle to prevent leak */
+                if (hThread) CloseHandle(hThread); // CRÍTICO: cerrar handle del hilo para prevenir fugas
             } else {
                 AppendTextToEdit(hCrearOutput, tw("select_ppf_info"));
                 free(p);
             }
             break;
         }
-        case 133: // Añadir file_id.diz (f)
+        case 133: // Añadir archivo.diz (f)
         {
             PROC_THREAD_PARAM *p = (PROC_THREAD_PARAM*)malloc(sizeof(PROC_THREAD_PARAM));
             p->hEdit = hCrearOutput;
@@ -3165,7 +3683,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 AppendQuotedArg(p->cmdline, sizeof(p->cmdline)/sizeof(wchar_t), ppf);
                 AppendQuotedArg(p->cmdline, sizeof(p->cmdline)/sizeof(wchar_t), fileid);
                 HANDLE hThread = CreateThread(NULL, 0, ProcessCaptureThread, p, 0, NULL);
-                if (hThread) CloseHandle(hThread); /* CRITICAL: Close thread handle to prevent leak */
+                if (hThread) CloseHandle(hThread); // CRÍTICO: cerrar handle del hilo para prevenir fugas
             } else {
                 AppendTextToEdit(hCrearOutput, tw("select_ppf_fileid"));
                 free(p);
@@ -3174,6 +3692,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         case 134: // Limpiar salida crear
             SetWindowTextW(hCrearOutput, L"");
+            // Resetear barra de progreso a 0 y mantener visible pero no interactiva
+            CrearProgress_ResetToZero();
             break;
 
         // Aplicar Parche browse
@@ -3193,7 +3713,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             // Set filter: image -> files, ppf -> PPF
             {
                 static wchar_t filter[256];
-                const wchar_t *lbl_files = tw("filter_files");
+                const wchar_t *lbl_files = tw("filter_images");
                 const wchar_t *lbl_all = tw("filter_all");
                 const wchar_t *lbl_ppf = tw("filter_ppf");
                 if (id == 211) {
@@ -3222,28 +3742,23 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     ofn.lpstrFilter = filter;
                 }
             }
-            BOOL hasInitialDir = FALSE;
             if (hTarget && GetWindowTextW(hTarget, initialDir, MAX_PATH) && wcslen(initialDir) > 0) {
                 GetParentFolder(initialDir, initialDir, MAX_PATH);
                 ofn.lpstrInitialDir = initialDir;
-                hasInitialDir = TRUE;
             } else {
                 // Use executable dir
                 static wchar_t exeDir3[MAX_PATH] = {0};
                 GetExecutableDirectory(exeDir3, MAX_PATH);
                 ofn.lpstrInitialDir = exeDir3;
             }
-            // Prefer COM dialog; if it fails, fall back to classic dialog.
+            // Use modern COM dialog
             HRESULT hrDlg = S_OK;
-            BOOL ok = ShowOpenFileDialog_COM(hwnd, filename, MAX_PATH, ofn.lpstrInitialDir, ofn.lpstrFilter, &hrDlg);
-            if (!ok && hrDlg != HRESULT_FROM_WIN32(ERROR_CANCELLED)) {
-                ok = GetOpenFileNameW(&ofn);
-            }
+            BOOL ok = ShowSaveFileDialog_COM(hwnd, filename, MAX_PATH, ofn.lpstrInitialDir, ofn.lpstrFilter, &hrDlg, OFN_FILEMUSTEXIST);
             if (ok) {
                 if (hTarget) {
-                    SetWindowTextW(hTarget, filename);
+                    SetWindowTextAndScroll(hTarget, filename);
                 }
-                // If user selected a PPF in Aplicar tab, automatically show its info (including embedded file_id)
+                // If user selected a PPF in Aplicar tab, automatically show its info (including embedded DIZ)
                 if (id == 212) {
                     PROC_THREAD_PARAM *p = (PROC_THREAD_PARAM*)malloc(sizeof(PROC_THREAD_PARAM));
                     if (p) {
@@ -3253,9 +3768,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                         wcscpy(p->cmdline, L"MakePPF");
                         wcscat(p->cmdline, L" s");
                         AppendQuotedArg(p->cmdline, sizeof(p->cmdline)/sizeof(wchar_t), filename);
+                        // Don't set progress callback for info display to avoid showing progress bar
                         HANDLE hThread = CreateThread(NULL, 0, ProcessCaptureThread, p, 0, NULL);
-                        if (hThread) CloseHandle(hThread); /* CRITICAL: Close thread handle to prevent leak */
-                        /* Ensure browse buttons are enabled after starting the worker thread (workaround for intermittent disable bug) */
+                        if (hThread) CloseHandle(hThread); // CRÍTICO: cerrar handle del hilo para prevenir fugas
+                        // Asegurar que los botones de exploración estén habilitados después de iniciar el hilo trabajador (workaround para bug intermitente de deshabilitado)
                         if (g_hwndMain) PostMessageW(g_hwndMain, WM_ENABLE_BROWSE, (WPARAM)1, 0);
                         else PostMessageW(GetForegroundWindow(), WM_ENABLE_BROWSE, (WPARAM)1, 0);
                     }
@@ -3287,11 +3803,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             SaveSettings(hCrearEditImg, hCrearEditMod, hCrearEditPPF, hCrearEditDIZ, hCrearEditDesc, hCrearChkUndo, hCrearChkValid, hCrearComboTipo,
                          hAplicarEditImg, hAplicarEditPPF, hAplicarChkRevert);
                 HANDLE hThread = CreateThread(NULL, 0, ProcessCaptureThread, p, 0, NULL);
-                if (hThread) CloseHandle(hThread); /* CRITICAL: Close thread handle to prevent leak */
+                if (hThread) CloseHandle(hThread); // CRÍTICO: cerrar handle del hilo para prevenir fugas
             break;
         }
         case 232: // Limpiar salida aplicar
             SetWindowTextW(hAplicarOutput, L"");
+            // Resetear progreso de la pestaña Crear a cero, mantener visible y no interactiva
+            CrearProgress_ResetToZero();
+            // Resetear progreso de la pestaña Aplicar a cero, mantener visible y no interactiva
+            AplicarProgress_ResetToZero();
             break;
         }
         break;
@@ -3649,6 +4169,16 @@ LRESULT CALLBACK TabProc(HWND hwndTab, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (g_tabAnimFrom >= 0) { RECT r; TabCtrl_GetItemRect(hwndTab, g_tabAnimFrom, &r); InvalidateRect(hwndTab, &r, TRUE); }
             if (g_tabAnimTo >= 0) { RECT r; TabCtrl_GetItemRect(hwndTab, g_tabAnimTo, &r); InvalidateRect(hwndTab, &r, TRUE); }
             g_tabLastSelected = idx;
+
+            // El control no siempre envía TCN_SELCHANGE en este camino, así que forzarlo para que
+            // los paneles de contenido se actualicen de forma fiable.
+            {
+                NMHDR nmhdr = {0};
+                nmhdr.hwndFrom = hwndTab;
+                nmhdr.idFrom = GetDlgCtrlID(hwndTab);
+                nmhdr.code = TCN_SELCHANGE;
+                SendMessageW(GetParent(hwndTab), WM_NOTIFY, (WPARAM)nmhdr.idFrom, (LPARAM)&nmhdr);
+            }
         }
         return 0;
     }
@@ -3764,17 +4294,71 @@ LRESULT CALLBACK AboutWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         case WM_CREATE: {
             const wchar_t *text = (const wchar_t*)((LPCREATESTRUCTW)lParam)->lpCreateParams;
             RECT rc; GetClientRect(hwnd, &rc);
-            /* Create Segoe UI 10pt to match main UI and store it on the window so we can free it at destroy */
+
+            // Declarar previamente AboutLinkProc para poder subclasificar el control estático de la URL
+            LRESULT CALLBACK AboutLinkProc(HWND hwndLink, UINT msg, WPARAM wParam, LPARAM lParam);
+            // Crear fuente Segoe UI 10pt para coincidir con la UI principal y almacenarla en la ventana para liberarla en destroy
             int dpi = GetWindowDPI(hwnd);
             LOGFONTW lf = {0}; lf.lfHeight = -MulDiv(10, dpi, 72); wcscpy(lf.lfFaceName, L"Segoe UI");
             HFONT hf = CreateFontIndirectW(&lf);
             if (hf) SetPropW(hwnd, L"AboutFont", (HANDLE)hf);
-            /* static area fits text with margins; keep simple centered layout */
+            // Área estática se ajusta al texto con márgenes; mantener un layout centrado y simple
             int margin = ScaleForWindow(hwnd,12);
             int btnH = ScaleForWindow(hwnd,28);
             RECT rcStatic = { margin, margin, rc.right - margin, rc.bottom - margin - (btnH + ScaleForWindow(hwnd,12)) };
-            HWND hStatic = CreateWindowW(L"STATIC", text, WS_CHILD | WS_VISIBLE | SS_CENTER, rcStatic.left, rcStatic.top, rcStatic.right - rcStatic.left, rcStatic.bottom - rcStatic.top, hwnd, NULL, GetModuleHandleW(NULL), NULL);
-            if (hf) SendMessageW(hStatic, WM_SETFONT, (WPARAM)hf, TRUE);
+
+            // Split text into body and URL (if present) so only the URL area is clickable
+            const wchar_t *urlStart = wcsstr(text, L"http");
+            wchar_t *body = NULL;
+            wchar_t *url = NULL;
+            if (urlStart) {
+                size_t bodyLen = (size_t)(urlStart - text);
+                while (bodyLen > 0 && iswspace((unsigned short)text[bodyLen-1])) bodyLen--;
+                body = (wchar_t*)_alloca((bodyLen + 1) * sizeof(wchar_t));
+                wcsncpy_s(body, bodyLen + 1, text, bodyLen);
+                body[bodyLen] = L'\0';
+                url = _wcsdup(urlStart);
+            } else {
+                body = (wchar_t*)text;
+            }
+
+            // Measure body and url to size controls properly
+            HDC hdcBody = GetDC(hwnd);
+            HGDIOBJ oldFont = NULL;
+            if (hf) oldFont = SelectObject(hdcBody, hf);
+            RECT rcBody = {0,0, rcStatic.right - rcStatic.left, 0};
+            DrawTextW(hdcBody, body, -1, &rcBody, DT_CALCRECT | DT_WORDBREAK | DT_CENTER);
+            RECT rcUrl = {0,0, rcStatic.right - rcStatic.left, 0};
+            if (url) DrawTextW(hdcBody, url, -1, &rcUrl, DT_CALCRECT | DT_WORDBREAK | DT_CENTER);
+            if (oldFont) SelectObject(hdcBody, oldFont);
+            ReleaseDC(hwnd, hdcBody);
+
+            // Create body static (non-clickable)
+            HWND hStaticBody = CreateWindowW(L"STATIC", body, WS_CHILD | WS_VISIBLE | SS_CENTER, rcStatic.left, rcStatic.top, rcStatic.right - rcStatic.left, rcBody.bottom, hwnd, NULL, GetModuleHandleW(NULL), NULL);
+            if (hf) SendMessageW(hStaticBody, WM_SETFONT, (WPARAM)hf, TRUE);
+
+            // Create URL static (clickable only when URL present)
+            if (url) {
+                int urlTop = rcStatic.top + rcBody.bottom;
+                // Add vertical padding between body and URL (no visible separator)
+                int padBetween = ScaleForWindow(hwnd, 8); if (padBetween < 2) padBetween = 2;
+                // Añadir una línea extra de espacio entre el cuerpo y la URL
+                padBetween += ScaleForWindow(hwnd, 8);
+                int linkTop = urlTop + padBetween;
+                HWND hLink = CreateWindowW(L"STATIC", url, WS_CHILD | WS_VISIBLE | SS_CENTER | SS_NOTIFY, rcStatic.left, linkTop, rcStatic.right - rcStatic.left, rcUrl.bottom, hwnd, (HMENU)ID_ABOUT_LINK, GetModuleHandleW(NULL), NULL);
+                if (hf) SendMessageW(hLink, WM_SETFONT, (WPARAM)hf, TRUE);
+                // Subclasificar el control de enlace para cambiar el cursor a mano al pasar el ratón (sin cambios visuales)
+                oldAboutLinkProc = (WNDPROC)SetWindowLongPtrW(hLink, GWLP_WNDPROC, (LONG_PTR)AboutLinkProc);
+                free(url);
+            }
+
+            // For help dialog, align text to the left
+            wchar_t title[256];
+            GetWindowTextW(hwnd, title, 256);
+            if (wcscmp(title, T(L"help_title")) == 0) {
+                SetWindowLongPtrW(hStaticBody, GWL_STYLE, WS_CHILD | WS_VISIBLE | SS_LEFT);
+                InvalidateRect(hStaticBody, NULL, TRUE);
+            }
             const wchar_t *okText = (g_lang == LANG_EN) ? L"OK" : L"Aceptar";
             int okW = ScaleForWindow(hwnd,80);
             HWND hBtn = CreateWindowW(L"BUTTON", okText, BTN_STYLE_DEFAULT, (rc.right - okW)/2, rc.bottom - btnH - ScaleForWindow(hwnd,8), okW, btnH, hwnd, (HMENU)IDOK, GetModuleHandleW(NULL), NULL);
@@ -3788,12 +4372,40 @@ LRESULT CALLBACK AboutWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             return 0;
         }
         case WM_COMMAND:
+            // If the about-text static was clicked, open the project URL in default browser
+            if (LOWORD(wParam) == ID_ABOUT_LINK && HIWORD(wParam) == STN_CLICKED) {
+                ShellExecuteW(hwnd, L"open", L"https://github.com/PeterDelta/PPFManager", NULL, NULL, SW_SHOWNORMAL);
+                return 0;
+            }
             if (LOWORD(wParam) == IDOK) {
                 DestroyWindow(hwnd);
                 return 0;
             }
             break;
+        case WM_CTLCOLORSTATIC:
+            SetTextColor((HDC)wParam, g_clrText);
+            SetBkColor((HDC)wParam, g_clrBg);
+            return (LRESULT)g_brBg;
+        case WM_CTLCOLORBTN:
+            SetTextColor((HDC)wParam, g_clrText);
+            SetBkColor((HDC)wParam, g_clrBg);
+            return (LRESULT)g_brBg;
+        case WM_ERASEBKGND:
+            {
+                HDC hdc = (HDC)wParam;
+                RECT rc;
+                GetClientRect(hwnd, &rc);
+                FillRect(hdc, &rc, g_brBg);
+                return 1;
+            }
         case WM_CLOSE:
+            // signal shutdown so any background worker can bail out
+            InterlockedExchange(&g_app_closing, 1);
+            if (g_operation_running) {
+                // force-close files associated with the current operation; that will trigger
+                // read/write errors in the worker thread and cause it to exit early.
+                CloseAllFiles();
+            }
             DestroyWindow(hwnd);
             return 0;
         default:
@@ -3802,8 +4414,20 @@ LRESULT CALLBACK AboutWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
+// Procedimiento de subclase para el control estático de la URL en 'Acerca de' para mostrar cursor de mano al pasar el ratón
+LRESULT CALLBACK AboutLinkProc(HWND hwndLink, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+        case WM_SETCURSOR:
+            SetCursor(LoadCursor(NULL, IDC_HAND));
+            return TRUE;
+    }
+    if (oldAboutLinkProc) return CallWindowProcW(oldAboutLinkProc, hwndLink, msg, wParam, lParam);
+    return DefWindowProcW(hwndLink, msg, wParam, lParam);
+}
+
 // Punto de entrada principal Unicode para aplicaciones WinAPI
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLine, int nCmdShow) {
+    (void)hPrevInstance; (void)lpCmdLine; 
     // --- MODO CONSOLA ---
     int argc = 0;
     LPWSTR *argvW = CommandLineToArgvW(GetCommandLineW(), &argc);
@@ -3815,6 +4439,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
         DWORD count = GetConsoleProcessList(pids, (DWORD)(sizeof(pids) / sizeof(pids[0])));
         if (count > 1) inherited_console = TRUE;
     }
+    // `handled` and `result` are declared later only when console mode is active,
+    // avoiding unused-variable warnings in the GUI path.
 
     // Single EXE behavior:
     // - If args are present, run CLI (attach to parent console if needed).
@@ -3822,12 +4448,18 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
     // - If launched by double-click (console exists but not inherited), do NOT run CLI; detach and run GUI.
     BOOL attached_console = FALSE;
     if (argc > 1) {
-        if (!hCon) {
-            if (AttachConsole(ATTACH_PARENT_PROCESS)) {
-                hCon = GetConsoleWindow();
+        // Check if stdout is already redirected (e.g., by PowerShell)
+        if (_fileno(stdout) < 0) {
+            if (!hCon) {
+                if (AttachConsole(ATTACH_PARENT_PROCESS)) {
+                    hCon = GetConsoleWindow();
+                }
             }
+            attached_console = (hCon != NULL);
+        } else {
+            // stdout is already valid, assume we're in a redirected environment
+            attached_console = TRUE;
         }
-        attached_console = (hCon != NULL);
     } else if (inherited_console) {
         attached_console = TRUE;
     } else {
@@ -3842,26 +4474,30 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
     }
 
     if (attached_console) {
-        // Redirigir stdio al mismo console (no abrir una nueva ventana)
-        freopen("CONOUT$", "w", stdout);
-        freopen("CONOUT$", "w", stderr);
-        freopen("CONIN$", "r", stdin);
-        setvbuf(stdout, NULL, _IONBF, 0);
-        setvbuf(stderr, NULL, _IONBF, 0);
+        // Only redirect stdio if we attached to console; if stdout was already valid, keep it as is
+        BOOL did_attach = (argc > 1 && _fileno(stdout) < 0 && hCon != NULL);
+        if (did_attach) {
+            // Redirigir stdio al mismo console (no abrir una nueva ventana)
+            freopen("CONOUT$", "w", stdout);
+            freopen("CONOUT$", "w", stderr);
+            freopen("CONIN$", "r", stdin);
+            setvbuf(stdout, NULL, _IONBF, 0);
+            setvbuf(stderr, NULL, _IONBF, 0);
 
-        // Establecer CP UTF-8 para mostrar correctamente caracteres especiales (ñ, á, etc.)
-        SetConsoleOutputCP(CP_UTF8);
-        SetConsoleCP(CP_UTF8);
-        // Intentar activar secuencias ANSI si es posible
-        HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
-        DWORD mode = 0;
-        if (hOut && GetConsoleMode(hOut, &mode)) {
-            SetConsoleMode(hOut, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+            // Establecer CP UTF-8 para mostrar correctamente caracteres especiales (ñ, á, etc.)
+            SetConsoleOutputCP(CP_UTF8);
+            SetConsoleCP(CP_UTF8);
+            // Intentar activar secuencias ANSI si es posible
+            HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+            DWORD mode = 0;
+            if (hOut && GetConsoleMode(hOut, &mode)) {
+                SetConsoleMode(hOut, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+            }
         }
 
         // Establecer la locale a UTF-8 (ayuda con conversiones de banda estrecha)
         setlocale(LC_ALL, ".UTF-8");
-        /* Detectar idioma del sistema para modo consola (se puede sobreescribir con INI o variable de entorno) */
+        // Detectar idioma del sistema para modo consola (se puede sobreescribir con INI o variable de entorno)
         SetLangFromSystem();
         // Si existe settings.ini, preferir la configuración guardada (LangEn)
         {
@@ -3882,28 +4518,73 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
 
         char **argv = (char **)malloc(argc * sizeof(char*));
         for (int i = 0; i < argc; ++i) {
-            int len = WideCharToMultiByte(CP_UTF8, 0, argvW[i], -1, NULL, 0, NULL, NULL);
+            // Usar CP_ACP para la conversión de argv y mantener comportamiento consistente con el modo GUI
+            // (la GUI lanza/ejecuta MakePPF con conversión ANSI/CP_ACP). Esto evita
+            // diferencias de bytes (UTF-8 vs ANSI) en campos de descripción/archivo que
+            // cambiarían el CRC producido del PPF según el llamador.
+            int len = WideCharToMultiByte(CP_ACP, 0, argvW[i], -1, NULL, 0, NULL, NULL);
+            if (len <= 0) len = WideCharToMultiByte(CP_UTF8, 0, argvW[i], -1, NULL, 0, NULL, NULL);
             argv[i] = (char*)malloc(len);
-            WideCharToMultiByte(CP_UTF8, 0, argvW[i], -1, argv[i], len, NULL, NULL);
+            if (len > 0) {
+                if (!WideCharToMultiByte(CP_ACP, 0, argvW[i], -1, argv[i], len, NULL, NULL)) {
+                    // Alternativa: usar UTF-8 si la conversión ACP falla
+                    WideCharToMultiByte(CP_UTF8, 0, argvW[i], -1, argv[i], len, NULL, NULL);
+                }
+            }
         }
         int handled = 0;
         if (argc > 1) {
+            // emit test-specific markers early so they appear in captured stdout
+            if (getenv("PPFMANAGER_TEST_FORCE_OOM") && getenv("PPFMANAGER_TEST_FORCE_OOM")[0] == '1') {
+                printf("TEST_OOM=1\n"); fflush(stdout);
+            }
+            // Support for special test command 'x' which executes an external shell command.
+            // This is used by the regression harness (long-output, interrupt-apply, etc.)
+            if (argv[1][0] == 'x' && argv[1][1] == '\0') {
+                handled = 1;
+                if (argc >= 3) {
+                    // build command line from remaining args
+                    size_t len = 0;
+                    for (int i = 2; i < argc; ++i) {
+                        len += strlen(argv[i]) + 1;
+                    }
+                    char *cmd = (char*)malloc(len + 1);
+                    if (cmd) {
+                        cmd[0] = '\0';
+                        for (int i = 2; i < argc; ++i) {
+                            strcat(cmd, argv[i]);
+                            if (i + 1 < argc) strcat(cmd, " ");
+                        }
+                        // echo marker for tests if requested
+                        if (getenv("PPFMANAGER_TEST_INJECT_STDOUT_MARKERS") && getenv("PPFMANAGER_TEST_INJECT_STDOUT_MARKERS")[0] == '1') {
+                            printf("[TEST] executing external: %s\n", cmd);
+                        }
+                        // system() will use cmd.exe /c; ignore returned code (not used)
+                        (void)system(cmd);
+                        free(cmd);
+                    }
+                }
+            }
             // --- MakePPF modo consola ---
-            if (argv[1][0] == 'c' || argv[1][0] == 's' || argv[1][0] == 'f') {
+            else if (argv[1][0] == 'c' || argv[1][0] == 's' || argv[1][0] == 'f') {
                 extern void CheckSwitches(int argc, char **argv);
                 extern int OpenFilesForCreate(void);
                 extern void PPFCreatePatch(void);
-                extern void CloseAllFiles(void);
                 extern int CheckIfPPF3(void);
                 extern void PPFShowPatchInfo(void);
                 extern int PPFAddFileId(void);
                 extern int CheckIfFileId(void);
                 extern int ppf, fileid;
+                extern void CloseAllFiles(void);
                 handled = 1;
                 if (argv[1][0] == 'c') {
                     if (argc < 5) {
                         ConsolePutW(tw("usage_c"));
                     } else {
+                        // Inicializar argumentos de MakePPF con los mismos valores por defecto usados por MakePPF_Main
+                        // para evitar estados obsoletos/no inicializados cuando se llama en proceso.
+                        MakePPF_InitArgs();
+
                         CheckSwitches(argc, argv);
                         if (OpenFilesForCreate()) {
                             StdoutRedirect redirect; if (RedirectStdout(&redirect)) {
@@ -3927,7 +4608,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
                                 }
                                 if (redirect.buffer) free(redirect.buffer);
                             } else {
-                                // fallback: call directly
+                                // alternativa: llamar directamente
                                 PPFCreatePatch();
                             }
                             ConsolePutW(tw("patch_created")); ConsolePutW(L"\r\n"); fflush(stdout);
@@ -3940,7 +4621,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
                     if (argc < 3) {
                         ConsolePutW(tw("usage_s"));
                     } else {
-                        /* Print header exactly as MakePPF does, before any other output. Prefix with a blank line so it starts on its own line in CMD for GUI-mode executables. */
+                        // Imprimir encabezado exactamente como lo hace MakePPF, antes de cualquier otra salida. Prefijar con una línea en blanco para que empiece en su propia línea en CMD para ejecutables en modo GUI.
                         ConsolePrintfKeyMB("makeppf_header", __DATE__);
                         fflush(stdout);
 
@@ -4005,6 +4686,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
                 extern void ApplyPPF1Patch(int ppf, int bin);
                 extern void ApplyPPF2Patch(int ppf, int bin);
                 extern void ApplyPPF3Patch(int ppf, int bin, char mode);
+                // Finalizar helper (reemplaza temp->original cuando ApplyPPF se llama en proceso)
+                extern void ApplyPPF_Finalize(void);
+                // Exponer estado de éxito de ApplyPPF para que el flujo de consola pueda reportar fallos
+                extern int ApplyPPF_GetSuccess(void);
                 extern int ppf, bin;
                 #define APPLY 1
                 #define UNDO 2
@@ -4016,16 +4701,62 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
                     } else {
                         int x = PPFVersion(ppf);
                         if (argv[1][0] == 'a') {
-                            if (x == 1) { ApplyPPF1Patch(ppf, bin); ConsolePutW(tw("ppf1_applied")); }
-                            else if (x == 2) { ApplyPPF2Patch(ppf, bin); ConsolePutW(tw("ppf2_applied")); }
-                            else if (x == 3) { ApplyPPF3Patch(ppf, bin, APPLY); ConsolePutW(tw("ppf3_applied")); }
-                            else { ConsolePutW(tw("unknown_patch_version")); }
+                            // Capturar y traducir la salida de ApplyPPF para que los mensajes aparezcan localizados en modo consola
+                            StdoutRedirect redirect; if (RedirectStdout(&redirect)) {
+                                if (x == 1) { ApplyPPF1Patch(ppf, bin); }
+                                else if (x == 2) { ApplyPPF2Patch(ppf, bin); }
+                                else if (x == 3) { ApplyPPF3Patch(ppf, bin, APPLY); }
+                                RestoreStdout(&redirect);
+                                if (redirect.buffer && redirect.buffer[0]) {
+                                    char *start = redirect.buffer; char *end = redirect.buffer + redirect.buffer_size;
+                                    while (start < end) {
+                                        char *nl = (char*)memchr(start, '\n', end - start);
+                                        size_t linelen = nl ? (size_t)(nl - start + 1) : (size_t)(end - start);
+                                        if (linelen == 0) { start = nl ? nl + 1 : end; continue; }
+                                        char linebuf[4096]; if (linelen >= sizeof(linebuf)) linelen = sizeof(linebuf)-1;
+                                        memcpy(linebuf, start, linelen); linebuf[linelen]=0;
+                                        size_t real_len = linelen; while (real_len > 0 && (linebuf[real_len-1]=='\n' || linebuf[real_len-1]=='\r')) linebuf[--real_len]=0;
+                                        int wlen = MultiByteToWideChar(CP_UTF8, 0, linebuf, -1, NULL, 0);
+                                        wchar_t *wline = NULL; if (wlen <= 0) { wlen = MultiByteToWideChar(CP_ACP, 0, linebuf, -1, NULL, 0); if (wlen>0) { wline=(wchar_t*)malloc(wlen*sizeof(wchar_t)); MultiByteToWideChar(CP_ACP,0,linebuf,-1,wline,wlen);} } else { wline=(wchar_t*)malloc(wlen*sizeof(wchar_t)); MultiByteToWideChar(CP_UTF8,0,linebuf,-1,wline,wlen);} 
+                                        if (wline) { wchar_t *tline = TranslateConsoleLine(wline); free(wline); if (tline) { ConsolePutW(tline); ConsolePutW(L"\r\n"); free(tline);} }
+                                        start = nl ? nl + 1 : end;
+                                    }
+                                }
+                                if (redirect.buffer) free(redirect.buffer);
+                            } else {
+                                // Alternativa: invocación directa cuando la redirección no está disponible
+                                if (x == 1) { ApplyPPF1Patch(ppf, bin); }
+                                else if (x == 2) { ApplyPPF2Patch(ppf, bin); }
+                                else if (x == 3) { ApplyPPF3Patch(ppf, bin, APPLY); }
+                            }
+                            if (ApplyPPF_GetSuccess()) ConsolePutW(tw("ppf3_applied")); else ConsolePutW(tw("ppf_apply_failed"));
                         } else if (argv[1][0] == 'u') {
-                            if (x == 3) { ApplyPPF3Patch(ppf, bin, UNDO); ConsolePutW(tw("ppf3_undo_applied")); }
-                            else { ConsolePutW(tw("undo_supported_only_ppf3")); }
+                            StdoutRedirect redirect2; if (RedirectStdout(&redirect2)) {
+                                if (x == 3) { ApplyPPF3Patch(ppf, bin, UNDO); }
+                                RestoreStdout(&redirect2);
+                                if (redirect2.buffer && redirect2.buffer[0]) {
+                                    char *start = redirect2.buffer; char *end = redirect2.buffer + redirect2.buffer_size;
+                                    while (start < end) {
+                                        char *nl = (char*)memchr(start, '\n', end - start);
+                                        size_t linelen = nl ? (size_t)(nl - start + 1) : (size_t)(end - start);
+                                        if (linelen == 0) { start = nl ? nl + 1 : end; continue; }
+                                        char linebuf[4096]; if (linelen >= sizeof(linebuf)) linelen = sizeof(linebuf)-1;
+                                        memcpy(linebuf, start, linelen); linebuf[linelen]=0;
+                                        size_t real_len = linelen; while (real_len > 0 && (linebuf[real_len-1]=='\n' || linebuf[real_len-1]=='\r')) linebuf[--real_len]=0;
+                                        int wlen = MultiByteToWideChar(CP_UTF8, 0, linebuf, -1, NULL, 0);
+                                        wchar_t *wline = NULL; if (wlen <= 0) { wlen = MultiByteToWideChar(CP_ACP, 0, linebuf, -1, NULL, 0); if (wlen>0) { wline=(wchar_t*)malloc(wlen*sizeof(wchar_t)); MultiByteToWideChar(CP_ACP,0,linebuf,-1,wline,wlen);} } else { wline=(wchar_t*)malloc(wlen*sizeof(wchar_t)); MultiByteToWideChar(CP_UTF8,0,linebuf,-1,wline,wlen);} 
+                                        if (wline) { wchar_t *tline = TranslateConsoleLine(wline); free(wline); if (tline) { ConsolePutW(tline); ConsolePutW(L"\r\n"); free(tline);} }
+                                        start = nl ? nl + 1 : end;
+                                    }
+                                }
+                                if (redirect2.buffer) free(redirect2.buffer);
+                            } else {
+                                if (x == 3) { ApplyPPF3Patch(ppf, bin, UNDO); }
+                            }
+                            if (ApplyPPF_GetSuccess()) ConsolePutW(tw("ppf3_undo_applied")); else ConsolePutW(tw("ppf_apply_failed"));
                         }
-                        _close(bin);
-                        _close(ppf);
+                        // Finalizar reemplazo/limpieza de archivos temporales para que el apply en proceso refleje el comportamiento del modo independiente
+                        ApplyPPF_Finalize();
                     }
                 }
                 handled = 1;
@@ -4053,56 +4784,57 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
     if (argvW) LocalFree(argvW);
     // GUI mode: make sure stdout/stderr aren't left pointing at a released console.
     EnsureGuiStdioReady();
-    /* Try to set process DPI awareness to Per Monitor v2 if supported (do this BEFORE creating any windows) */
+    // Intentar establecer la conciencia DPI del proceso a Per Monitor v2 si está soportado (hacer esto ANTES de crear ventanas)
     typedef BOOL (WINAPI *SetProcessDpiAwarenessContext_t)(void*);
     SetProcessDpiAwarenessContext_t pSetProcessDpiAwarenessContext = (SetProcessDpiAwarenessContext_t)GetProcAddress(GetModuleHandleW(L"user32"), "SetProcessDpiAwarenessContext");
     if (pSetProcessDpiAwarenessContext) {
-        /* Per-monitor v2 context value is (DPI_AWARENESS_CONTEXT)-4 on supported OS */
+        // El valor de contexto Per-monitor v2 es (DPI_AWARENESS_CONTEXT)-4 en OS soportados
         pSetProcessDpiAwarenessContext((void*)(INT_PTR)-4);
     }
 
     INITCOMMONCONTROLSEX icex;
     icex.dwSize = sizeof(icex);
-    icex.dwICC = ICC_STANDARD_CLASSES | ICC_TAB_CLASSES | ICC_WIN95_CLASSES;
+    // Asegurar que la clase del control de progreso también esté inicializada
+    icex.dwICC = ICC_STANDARD_CLASSES | ICC_TAB_CLASSES | ICC_WIN95_CLASSES | ICC_PROGRESS_CLASS;
     InitCommonControlsEx(&icex);
 
     WNDCLASSEXW wc = {0};
     wc.cbSize = sizeof(wc);
     wc.lpfnWndProc = WndProc;
     wc.hInstance = hInstance;
-    /* Load embedded icon resource (resource ID 101) using system DPI if available */
+    // Cargar recurso de icono embebido (ID 101) usando el DPI del sistema si está disponible
     int sysdpi = GetSystemDPI();
-    int cxIcon = GetSystemMetricsForDpiSafe(SM_CXICON, sysdpi);
-    int cyIcon = GetSystemMetricsForDpiSafe(SM_CYICON, sysdpi);
-    int cxSm = GetSystemMetricsForDpiSafe(SM_CXSMICON, sysdpi);
-    int cySm = GetSystemMetricsForDpiSafe(SM_CYSMICON, sysdpi);
+    int cxIcon = GetSystemMetricsForDpi(SM_CXICON, sysdpi);
+    int cyIcon = GetSystemMetricsForDpi(SM_CYICON, sysdpi);
+    int cxSm = GetSystemMetricsForDpi(SM_CXSMICON, sysdpi);
+    int cySm = GetSystemMetricsForDpi(SM_CYSMICON, sysdpi);
     wc.hIcon = LoadIconWithScaleDownIfAvailable(hInstance, MAKEINTRESOURCEW(101), cxIcon, cyIcon);
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
     wc.hbrBackground = (HBRUSH)(COLOR_WINDOW+1);
     wc.lpszClassName = L"PPFManagerClass";
-    /* Small icon (titlebar/taskbar) */
+    // Icono pequeño (barra de título/area de tareas)
     wc.hIconSm = LoadIconWithScaleDownIfAvailable(hInstance, MAKEINTRESOURCEW(101), cxSm, cySm);
     RegisterClassExW(&wc);
 
-    int base_w = 545, base_h = 670; // base size at 96 DPI
+    int base_w = 545, base_h = 645; // Tamaño ventana a 96 DPI
 
-    /* Create window at base logical size, then resize it to the window's DPI after creation
-       (this ensures the size is calculated using the monitor DPI where the window is created) */
+    // Crear ventana con tamaño lógico base, luego redimensionarla al DPI de la ventana tras la creación
+    // (esto asegura que el tamaño se calcule usando el DPI del monitor donde se crea la ventana)
     HWND hwnd = CreateWindowW(L"PPFManagerClass", L"PPF Manager", WS_OVERLAPPEDWINDOW & ~WS_BORDER,
         CW_USEDEFAULT, CW_USEDEFAULT, base_w, base_h, NULL, NULL, hInstance, NULL);
     ShowWindow(hwnd, nCmdShow);
     UpdateWindow(hwnd);
 
-    /* After creation, query the window DPI and apply scaled dimensions */
+    // Después de la creación, consultar el DPI de la ventana y aplicar dimensiones escaladas
     int dpiInit = GetWindowDPI(hwnd);
     int scaled_w = MulDiv(base_w, dpiInit, 96);
     int scaled_h = MulDiv(base_h, dpiInit, 96);
     SetWindowPos(hwnd, NULL, 0, 0, scaled_w, scaled_h, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
 
-    /* Load and set proper-sized icons for the window (helps on high-DPI displays) */
+    // Cargar y establecer iconos de tamaño adecuado para la ventana (ayuda en pantallas de alto DPI)
     LoadAndSetIconsForDPI(hwnd, dpiInit);
 
-    /* Force initial layout recalculation */
+    // Forzar recálculo inicial de layout
     SendMessageW(hwnd, WM_SIZE, 0, 0);
 
     MSG msg;
@@ -4119,4 +4851,5 @@ int wmain(int argc, wchar_t **argv) {
     (void)argv;
     return wWinMain(GetModuleHandleW(NULL), NULL, GetCommandLineW(), SW_SHOWNORMAL);
 }
+
 
