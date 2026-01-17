@@ -1,0 +1,10 @@
+﻿Showing patchinfo... 
+Version     : PPF3.0
+Enc.Method  : 2
+Imagetype   : BIN
+Validation  : Enabled
+Undo Data   : Available
+Description : simple test                                       
+File.id_diz : Not available
+Done.
+

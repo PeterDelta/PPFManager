@@ -3,18 +3,11 @@
 *.dll
 *.lib
 *.obj
-*.o
 *.res
 *.pdb
 *.ilk
 *.log
-*.rc
 *.bat
-*.ico
-.manifest
-
-# Resource/object artifacts
-PPFManager_res.o
 
 # IDE/user state
 *.user
@@ -23,11 +16,8 @@ PPFManager_res.o
 *.bak
 *.swp
 ~$*
-
-# macOS/Windows detritus
 .DS_Store
 Thumbs.db
-PPFManager.manifest
-*.txt
-file_id.diz
-*.ppf
+tests/logs
+tests/work_cmp
+Comandos.txt

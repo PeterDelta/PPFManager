@@ -1,6 +1,5 @@
 /*
  *     MakePPF.c
- *     written by Icarus/Paradox
  *     suggestions and some fixes by <Hu Kares>, thanks.
  *
  *     Creates PPF3.0 Patches.
@@ -20,7 +19,22 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <windows.h>
+#include <stdarg.h>
 #include <errno.h>
+#include <limits.h>
+#include "ppfmanager.h"
+
+#ifndef BUILD_STANDALONE
+/* Use shared PrintWin32ErrorFmt from PPFManager (no local implementation needed) */
+#endif 
+
+#ifdef BUILD_STANDALONE
+/* Standalone helpers for I/O/LE are centralized in ppfmanager.h to avoid duplication */
+#endif
+#ifdef BUILD_STANDALONE
+/* Print helpers for standalone builds are provided centrally in ppfmanager.h */
+#endif
+
 
 // Used global variables.
 #ifdef BUILD_STANDALONE
@@ -58,7 +72,8 @@ Argumentblock Arg;
 int		OpenFilesForCreate(void);
 int		PPFCreateHeader(void);
 int		PPFGetChanges(void);
-int		WriteChanges(int amount, __int64 chunk);
+/* WriteChanges returns number of differences found, or -1 on error. Use 64-bit to avoid overflow on very large files. */
+long long	WriteChanges(int amount, __int64 chunk);
 int		CheckIfPPF3(void);
 int		CheckIfFileId(void);
 int		PPFAddFileId(void);
@@ -66,98 +81,16 @@ void	CloseAllFiles(void);
 void	PPFCreatePatch(void);
 void	CheckSwitches(int argc, char **argv);
 void	PPFShowPatchInfo(void);
-static void PrintRawTextBytes(const unsigned char *s);
 
-/* Print description bytes: prefer UTF-8, fallback to ANSI (CP_ACP). Use WriteConsoleW when stdout is a console. */
-static void PrintDescriptionBytes(const unsigned char *desc) {
-    if (!desc) { printf("Description : \n"); return; }
-    wchar_t *w = NULL;
-    int wlen = MultiByteToWideChar(CP_UTF8, 0, (char*)desc, -1, NULL, 0);
-    if (wlen > 0) {
-        w = (wchar_t*)malloc(wlen * sizeof(wchar_t));
-        if (!w) { printf("Description : %s\n", desc); return; }
-        MultiByteToWideChar(CP_UTF8, 0, (char*)desc, -1, w, wlen);
-        /* If conversion produced replacement chars, treat as invalid and fallback */
-        int bad = 0; for (int i = 0; i < wlen && w[i]; ++i) if (w[i] == 0xFFFD) { bad = 1; break; }
-        if (bad) { free(w); w = NULL; }
-    }
-    if (!w) {
-        wlen = MultiByteToWideChar(CP_ACP, 0, (char*)desc, -1, NULL, 0);
-        if (wlen > 0) {
-            w = (wchar_t*)malloc(wlen * sizeof(wchar_t));
-            if (!w) { printf("Description : %s\n", desc); return; }
-            MultiByteToWideChar(CP_ACP, 0, (char*)desc, -1, w, wlen);
-        }
-    }
 
-    if (w) {
-        HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
-        DWORD written = 0;
-        if (hOut && hOut != INVALID_HANDLE_VALUE) {
-            DWORD mode;
-            if (GetConsoleMode(hOut, &mode)) {
-                /* stdout is a console: write wide directly */
-                WriteConsoleW(hOut, L"Description : ", (DWORD)wcslen(L"Description : "), &written, NULL);
-                WriteConsoleW(hOut, w, (DWORD)wcslen(w), &written, NULL);
-                WriteConsoleW(hOut, L"\n", 1, &written, NULL);
-                free(w);
-                return;
-            }
-        }
-        /* stdout not a console: convert to UTF-8 and print */
-        int need = WideCharToMultiByte(CP_UTF8, 0, w, -1, NULL, 0, NULL, NULL);
-        char *out = (char*)malloc(need);
-        if (!out) { free(w); printf("Description : %s\n", desc); return; }
-        WideCharToMultiByte(CP_UTF8, 0, w, -1, out, need, NULL, NULL);
-        printf("Description : %s\n", out);
-        free(out);
-        free(w);
-        return;
-    }
-    /* last resort */
-    printf("Description : %s\n", desc);
-}
+/* Progress callback for GUI integration: percent in range 0.0 .. 100.0 */
+static void (*MakePPF_ProgressCallback)(double) = NULL;
+void MakePPF_SetProgressCallback(void (*cb)(double)) { MakePPF_ProgressCallback = cb; }
 
-/* Print raw text bytes (no label): prefer UTF-8, fallback to ANSI, use WriteConsoleW when stdout is attached */
-static void PrintRawTextBytes(const unsigned char *s) {
-    if (!s) { printf("\n"); return; }
-    wchar_t *w = NULL;
-    int wlen = MultiByteToWideChar(CP_UTF8, 0, (char*)s, -1, NULL, 0);
-    if (wlen > 0) {
-        w = (wchar_t*)malloc(wlen * sizeof(wchar_t));
-        if (!w) { printf("%s\n", s); return; }
-        MultiByteToWideChar(CP_UTF8, 0, (char*)s, -1, w, wlen);
-        int bad = 0; for (int i = 0; i < wlen && w[i]; ++i) if (w[i] == 0xFFFD) { bad = 1; break; }
-        if (bad) { free(w); w = NULL; }
-    }
-    if (!w) {
-        wlen = MultiByteToWideChar(CP_ACP, 0, (char*)s, -1, NULL, 0);
-        if (wlen > 0) {
-            w = (wchar_t*)malloc(wlen * sizeof(wchar_t));
-            if (!w) { printf("%s\n", s); return; }
-            MultiByteToWideChar(CP_ACP, 0, (char*)s, -1, w, wlen);
-        }
-    }
-    if (w) {
-        HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
-        DWORD written = 0, mode;
-        if (hOut && hOut != INVALID_HANDLE_VALUE && GetConsoleMode(hOut, &mode)) {
-            WriteConsoleW(hOut, w, (DWORD)wcslen(w), &written, NULL);
-            WriteConsoleW(hOut, L"\n", 1, &written, NULL);
-            free(w);
-            return;
-        }
-        int need = WideCharToMultiByte(CP_UTF8, 0, w, -1, NULL, 0, NULL, NULL);
-        char *out = (char*)malloc(need);
-        if (!out) { free(w); printf("%s\n", s); return; }
-        WideCharToMultiByte(CP_UTF8, 0, w, -1, out, need, NULL, NULL);
-        printf("%s\n", out);
-        free(out);
-        free(w);
-        return;
-    }
-    printf("%s\n", s);
-}
+static __int64 MakePPF_TotalBinFileSize = 0;
+
+
+
 
 
 
@@ -169,21 +102,13 @@ int main(int argc, char **argv)
 int MakePPF_Main(int argc, char **argv)
 #endif
 {
-	if(argc==1){
-		printf("Usage: PPFManager.exe c [Command] <original bin> <modified bin> <ppf>\n");
-		printf("<Commands>\n");
-		printf("  c : create PPF3.0 patch            f : add file_id.diz\n");
-		printf("  s : show patch infomation\n");
-		printf("<Switches>\n");
-		printf(" -u : include undo data (default=off)\n");
-		printf(" -x : disable patchvalidation (default=off)\n");
-		printf(" -i : imagetype, 0 = BIN, 1 = GI, 2 = ISO (default=bin)\n");
-		printf(" -d : \"write description\"\n");
-		printf(" -f : \"file_id.diz\" to insert the file into the patch\n");
-
-		printf("\nExamples: PPF c -u -i 0 -d \"my patch\" game.bin mod.bin output.ppf\n");
-		printf("          PPF f patch.ppf myfileid.diz\n");
-		return(0);
+	if (argc < 2) {
+		// No comando: mostrar ayuda
+		printf("[DEBUG] MakePPF_Main ejecutado, argc=%d\n", argc); fflush(stdout);
+		printf("Usage: PPFManager.exe <command> [args]\n");
+		printf("Commands: c (create), f (add file_id.diz), s (show info)\n");
+		fflush(stdout);
+		return 1;
 	}
 
 	// Setting defaults.
@@ -194,86 +119,99 @@ int MakePPF_Main(int argc, char **argv)
 	Arg.fileid=0;
 	Arg.desc=0;
 
-	switch(*argv[1]){
-	case 'c':			if(argc<5){
-							printf("Error: need more input for command '%s'\n",argv[1]);
-							break;
-						}
-						CheckSwitches(argc, argv);
-						if(OpenFilesForCreate()){
-							PPFCreatePatch();
-						} else {
-							break;
-						}
-						CloseAllFiles();
-						break;
 
-		case 's':		
-						if(argc<3){
-							printf("Error: need more input for command '%s'\n",argv[1]);
-							break;
-						}
-						ppf=_open(argv[2], _O_RDONLY | _O_BINARY);
-						if(ppf==-1){
-							printf("Error: cannot open file '%s': ",argv[2]); perror("");
-							break;
-						}
-						if(!CheckIfPPF3()){
-							printf("Error: file '%s' is no PPF3.0 patch\n", argv[2]);
-							_close(ppf);
-							break;
-						}
+	char cmd = argv[1][0];
+	int ok = 0;
+	// Imprimir cabecera MakePPF clásico para 'c' y 'f' solo si faltan argumentos
+	if ((cmd == 'c' && argc < 5) || (cmd == 'f' && argc < 4)) {
+		printf("Usage: PPF <command> [-<sw> [-<sw>...]] <original bin> <modified bin> <ppf>\n");
+		printf("<Commands>\n");
+		printf("  c : create PPF3.0 patch            a : add file_id.diz\n");
+		printf("  s : show patchinfomation\n");
+		printf("<Switches>\n");
+		printf(" -u        : include undo data (default=off)\n");
+		printf(" -x        : disable patchvalidation (default=off)\n");
+		printf(" -i [0/1]  : imagetype, 0 = BIN, 1 = GI (default=bin)\n");
+		printf(" -d \"text\" : use \"text\" as description\n");
+		printf(" -f \"file\" : add \"file\" as file_id.diz\n");
+		printf("\nExamples: PPF c -u -i 1 -d \"my elite patch\" game.bin patch.bin output.ppf\n");
+		printf("          PPF a patch.ppf myfileid.txt\n\n");
+	}
+	switch (cmd) {
+		case 'c':
+			if (argc >= 5) {
+				CheckSwitches(argc, argv);
+				if (OpenFilesForCreate()) {
+					PPFCreatePatch();
+					CloseAllFiles();
+					ok = 1;
 
-						PPFShowPatchInfo();
-						_close(ppf);
-						break;
-		case 'f':		
-						if(argc<4){
-							printf("Error: need more input for command '%s'\n",argv[1]);
-							break;
-						}
-						ppf=_open(argv[2], _O_BINARY | _O_RDWR);
-						if(ppf==-1){
-							printf("Error: cannot open file '%s': ",argv[2]); perror("");
-							break;
-						}
-
-						fileid=_open(argv[3], _O_RDONLY | _O_BINARY);
-						if(fileid==-1){
-							printf("Error: cannot open file '%s': ",argv[3]); perror("");
-							CloseAllFiles();
-							break;
-						}
-						
-						if(!CheckIfPPF3()){
-							printf("Error: file '%s' is no PPF3.0 patch\n", argv[2]);
-							CloseAllFiles();
-							break;
-						}
-
-						if(!CheckIfFileId()){
+				}
+			}
+			break;
+		case 's':
+			if (argc >= 3) {
+				ppf = _open(argv[2], _O_RDONLY | _O_BINARY);
+				if (ppf != -1 && CheckIfPPF3()) {
+					PPFShowPatchInfo();
+					_close(ppf);
+					ok = 1;
+				} else if (ppf != -1) {
+					printf("Error: file '%s' is no PPF3.0 patch\n", argv[2]);
+					_close(ppf);
+				}
+			}
+			break;
+		case 'f':
+			if (argc >= 4) {
+				ppf = _open(argv[2], _O_BINARY | _O_RDWR);
+				if (ppf != -1) {
+					fileid = _open(argv[3], _O_RDONLY | _O_BINARY);
+					if (fileid != -1 && CheckIfPPF3()) {
+						if (!CheckIfFileId()) {
 							PPFAddFileId();
 						} else {
 							printf("Error: patch already contains a file_id.diz\n");
 						}
-
 						CloseAllFiles();
-						break;
-		default :		printf("Error: unknown command '%s'\n",argv[1]); break;
+						ok = 1;
+					} else if (fileid != -1) {
+						printf("Error: file '%s' is no PPF3.0 patch\n", argv[2]);
+						CloseAllFiles();
+					}
+				}
+			}
+			break;
+		default:
+			printf("Error: unknown command '%s'\n", argv[1]);
+			break;
 	}
 
+	if (!ok) {
+		// Solo mostrar ayuda si no se ejecutó ningún comando válido
+		printf("Usage: PPFManager.exe <command> [args]\n");
+		printf("Commands: c (create), f (add file_id.diz), s (show info)\n");
+		return 1;
+	}
+	/* Canonical final message (always the same to avoid cosmetic diffs) */
 	printf("Done.\n");
-	return(0);
+	return 0;
 
 }
 
 // Start to create the patch.
 void PPFCreatePatch(void){
 
-	if(PPFCreateHeader()){ printf("Error: headercreation failed\n"); return; }
+	/* Start progress */
+	if (MakePPF_ProgressCallback) MakePPF_ProgressCallback(0.0);
 
-	PPFGetChanges();
-	if(Arg.fileid) PPFAddFileId();
+	if(PPFCreateHeader()){ printf("Error: headercreation failed\n"); if (MakePPF_ProgressCallback) MakePPF_ProgressCallback(100.0); return; }
+
+	if (PPFGetChanges()) { printf("Error: failed while collecting changes\n"); if (MakePPF_ProgressCallback) MakePPF_ProgressCallback(100.0); CloseAllFiles(); return; }
+	if(Arg.fileid) { if (PPFAddFileId()) { printf("Error: failed to add file_id.diz\n"); CloseAllFiles(); return; } }
+
+	/* Finish progress */
+	if (MakePPF_ProgressCallback) MakePPF_ProgressCallback(100.0);
 
 	/* Mark patch as successfully created so temp file will be renamed */
 	patch_ok = 1;
@@ -288,7 +226,7 @@ int PPFCreateHeader(void){
 	unsigned char magic[]="PPF30";
 
 	printf("Writing header... "); fflush(stdout);
-	memset(description,0x20,50);
+
 
 	if(Arg.desc){
 		size_t desc_len = strlen(Arg.description);
@@ -296,15 +234,26 @@ int PPFCreateHeader(void){
 		for(i=0;i<desc_len;i++){
 			description[i]=Arg.description[i];
 		}
+		/* Ensure trailing bytes are explicitly spaces (defensive-initialization) */
+		for (size_t _j = desc_len; _j < 50; ++_j) description[_j] = 0x20;
 	}
 
-	if((_write(ppf, &magic, 5)) == -1 ) return(1);
-	if((_write(ppf, &method, 1)) == -1 ) return(1);
-	if((_write(ppf, &description, 50)) == -1 ) return(1);
-	if((_write(ppf, &Arg.imagetype, 1)) == -1 ) return(1);
-	if((_write(ppf, &Arg.blockcheck, 1)) == -1 ) return(1);
-	if((_write(ppf, &Arg.undo, 1)) == -1 ) return(1);
-	if((_write(ppf, &dummy, 1)) == -1 ) return(1);
+	if(safe_write(ppf, &magic, 5) != 0) { printf("Error: failed to write header\n"); return(1); }
+	if(safe_write(ppf, &method, 1) != 0) { printf("Error: failed to write header\n"); return(1); }
+	if(safe_write(ppf, &description, 50) != 0) { printf("Error: failed to write header\n"); return(1); }
+	{
+		unsigned char itype = (unsigned char)Arg.imagetype;
+		if (safe_write(ppf, &itype, 1) != 0) { printf("Error: failed to write header\n"); return(1); }
+	}
+	{
+		unsigned char bcheck = (unsigned char)Arg.blockcheck;
+		if (safe_write(ppf, &bcheck, 1) != 0) { printf("Error: failed to write header\n"); return(1); }
+	}
+	{
+		unsigned char udata = (unsigned char)Arg.undo;
+		if (safe_write(ppf, &udata, 1) != 0) { printf("Error: failed to write header\n"); return(1); }
+	}
+	if(safe_write(ppf, &dummy, 1) != 0) { printf("Error: failed to write header\n"); return(1); }
 
 	if(Arg.blockcheck){
 		/* imagetype: 0=BIN, 1=GI, 2=ISO */
@@ -316,21 +265,44 @@ int PPFCreateHeader(void){
 		} else {
 			_lseeki64(bin, 0x9320, SEEK_SET); /* BIN */
 		}
-		_read(bin,&binblock,1024);
-		if((_write(ppf, &binblock, 1024)) == -1 ) return(1);
+		{
+			int _rv = _read(bin, &binblock, 1024);
+			if (_rv < 0) { printf("Error: cannot read binblock\n"); return(1); }
+			if (_rv < 1024) memset(binblock + _rv, 0, 1024 - _rv);
+		}
+		if (safe_write(ppf, &binblock, 1024) != 0) return(1);
 	}
 
-	printf("done.\n");
+	/* Header creation completed */
+	printf("Done.\n"); fflush(stdout);
 	return(0);
 }
 
-// Part of the PPF3.0 algorythm to find file-changes. Please note that
-// 16 MegaBit is needed for the engine. Allocated by malloc();
+/* Initialize MakePPF global arguments to defaults to allow in-process invocation */
+void MakePPF_InitArgs(void) {
+	Arg.undo = 0;
+	Arg.blockcheck = 1;
+	Arg.blockcheck_set = 0;
+	Arg.imagetype = 0;
+	Arg.fileid = 0;
+	Arg.desc = 0;
+	Arg.description = NULL;
+	Arg.fileidname = NULL;
+	Arg.origname = NULL;
+	Arg.modname = NULL;
+	Arg.ppfname = NULL;
+}
+
+// Part of the PPF3.0 algorithm to find file-changes.
+// Uses a chunk buffer for scanning; current chunk size is 1 MiB (1048576).
+// Two buffers are allocated (total 2 MiB). Adjust the constant if larger
+// chunks are desired or required by the platform.
 // Return: 1 - Failed
 // Return: 0 - Success
 int PPFGetChanges(void){
-	int read=0, eightmb=1048576, changes=0;
-	unsigned long found=0;
+	int read=0, eightmb=1048576;
+	long long changes=0;
+	unsigned long long found=0;
 	__int64 chunk=0, filesize;
 	float percent;
 
@@ -345,7 +317,8 @@ int PPFGetChanges(void){
 	if(y==NULL){ printf("Error: insufficient memory available\n"); free(x); CloseAllFiles(); return(1); }
 
 	filesize=_filelengthi64(bin);
-	if(filesize == 0){ printf("Error: filesize of bin file is zero!\n"); free(x); free(y); return(1);}
+	MakePPF_TotalBinFileSize = filesize; /* allow WriteChanges() to compute sub-chunk progress */
+	if(filesize == 0){ printf("Error: filesize of bin file is zero!\n"); free(x); free(y); MakePPF_TotalBinFileSize = 0; return(1);}
 
 	_lseeki64(bin,0,SEEK_SET);
 	_lseeki64(mod,0,SEEK_SET);
@@ -353,24 +326,44 @@ int PPFGetChanges(void){
 	printf("Finding differences... \n");
 	printf("Progress: "); fflush(stdout);
 	do{
-		read=_read(bin,x,eightmb);
-		if(read!=0){
-			if(read==eightmb){
-				_read(mod,y,eightmb);
-				changes=WriteChanges(eightmb, chunk);
+		read = _read(bin, x, eightmb);
+		if (read < 0) { printf("Error: failed reading from source bin file\n"); free(x); free(y); return(1); }
+		if (read == 0) break; /* EOF */
+		if (read != 0) {
+			if (read == eightmb) {
+				if (_read(mod, y, eightmb) != eightmb) { printf("Error: short read from mod file\n"); free(x); free(y); return(1); }
+				long long rc = WriteChanges(eightmb, chunk);
+				if (rc < 0) { printf("Error: failed while writing changes\n"); free(x); free(y); return(1); }
+				changes = rc;
 			} else {
-				_read(mod,y,read);
-				changes=WriteChanges(read, chunk);
-			}			
+				if (_read(mod, y, read) != read) { printf("Error: short read from mod file\n"); free(x); free(y); return(1); }
+				long long rc = WriteChanges(read, chunk);
+				if (rc < 0) { printf("Error: failed while writing changes\n"); free(x); free(y); return(1); }
+				changes = rc;
+			}
 		}
-		chunk+=eightmb;
-		found+=changes;
+
+		/* Advance by the actual bytes read and update found-count */
+		if (read > 0) {
+			chunk += read;
+			found += changes;
+		}
 
 		percent=(float)chunk/filesize;
+		/* Report progress early and often to GUI: reserve 1% for header and 1% for finalization; scanning maps to 1..99% */
+		if (MakePPF_ProgressCallback) {
+			float overall = 1.0f + (percent * 98.0f);
+			if (overall < 0.0f) overall = 0.0f;
+			if (overall > 99.0f) overall = 99.0f; /* keep finalization for last step */
+			MakePPF_ProgressCallback((double)overall);
+		}
 
 	} while (read!=0);
 
-	printf(" 100.00 %% (%d entries found).\n", found);
+	if (MakePPF_ProgressCallback) MakePPF_ProgressCallback(100.0);
+	/* Done — clear the filesize sentinel */
+	MakePPF_TotalBinFileSize = 0;
+	printf(" 100.00 %% (%llu entries found).\n", (unsigned long long)found);
 
 	//Free memory.
 	free(x); free(y);
@@ -379,25 +372,39 @@ int PPFGetChanges(void){
 
 // This function actually scans the 8 Mbit blocks and writes down the patchdata
 // Return: Found differences.
-int WriteChanges(int amount, __int64 chunk){
-	int found=0;
-	unsigned __int64 i=0, offset;
+long long WriteChanges(int amount, __int64 chunk){
+	long long found = 0;
+	__int64 i = 0;
+	__int64 offset;
+	/* choose reporting granularity based on chunk size; aim for ~64 steps per chunk but allow small chunks to report frequently */
+	int report_step = (int)(amount / 64);
+	if (report_step < 1) report_step = 1;    /* ensure at least one update per byte for tiny chunks */
+	if (report_step > 65536) report_step = 65536; /* cap frequency for extremely large chunks */
 
-	for(i=0;i<amount;i++){
-		if(x[i]!=y[i]){
-			unsigned char k=0;
-			offset=chunk+i;
-			_write(ppf, &offset,8);
-			do{				
+	for (i = 0; i < (__int64)amount; i++) {
+		/* Periodic sub-chunk progress report (non-blocking, worker thread) */
+		if (MakePPF_ProgressCallback && MakePPF_TotalBinFileSize > 0 && ((i % (__int64)report_step) == 0)) {
+			double processed = ((double)(chunk + (__int64)i)) / (double)MakePPF_TotalBinFileSize;
+			double overall = 1.0 + (processed * 98.0);
+			if (overall < 0.0) overall = 0.0;
+			if (overall > 99.0) overall = 99.0; /* reserve last percent for finalization */
+			MakePPF_ProgressCallback(overall);
+		}
+
+		if (x[i] != y[i]) {
+			unsigned char k = 0;
+			offset = chunk + i;
+			if (write_le64(ppf, (unsigned long long)offset) != 0) return -1;
+			do {
 				k++; i++;
-			} while (i<amount&&x[i]!=y[i]&&k!=0xff);			  			
-			_write(ppf, &k, 1);
-			_write(ppf, &y[i-k], k);
+			} while (i < (__int64)amount && x[i] != y[i] && k != 0xff);
+			if (safe_write(ppf, &k, 1) != 0) return -1;
+			if (safe_write(ppf, &y[i-k], (size_t)k) != 0) return -1;
 			found++;
-			if(Arg.undo){
-				_write(ppf, &x[i-k], k); // Write undo data aswell
+			if (Arg.undo) {
+				if (safe_write(ppf, &x[i-k], (size_t)k) != 0) return -1; // Write undo data as well
 			}
-			if(k==0xff) i--;
+			if (k == 0xff) i--;
 		}
 	}
 	return(found);
@@ -410,13 +417,13 @@ int OpenFilesForCreate(void){
 
 	bin=_open(Arg.origname, _O_RDONLY | _O_BINARY | _O_SEQUENTIAL);
 	if(bin==-1){
-		printf("Error: cannot open file '%s': ",Arg.origname); perror("");
+		PrintWin32ErrorFmt("Error: cannot open file '%s'", Arg.origname);
 		CloseAllFiles();
 		return(0);
 	}	
 	mod=_open(Arg.modname,  _O_RDONLY | _O_BINARY | _O_SEQUENTIAL);
 	if(mod==-1){
-		printf("Error: cannot open file '%s': ",Arg.modname); perror("");
+		PrintWin32ErrorFmt("Error: cannot open file '%s'", Arg.modname);
 		CloseAllFiles();
 		return(0);
 	}
@@ -431,35 +438,60 @@ int OpenFilesForCreate(void){
 	if(Arg.fileid){
 		fileid=_open(Arg.fileidname, _O_RDONLY | _O_BINARY);
 		if(fileid==-1){
-			printf("Error: cannot open file '%s': ",Arg.fileidname); perror("");
+			PrintWin32ErrorFmt("Error: cannot open file '%s'", Arg.fileidname);
 			CloseAllFiles();
 			return(0);
 		}
 	}
 
 {
-		char tmpname[512];
-		int tryi;
-		using_temp = 0;
-		for(tryi=0; tryi<1000; tryi++){
-			if(tryi==0) _snprintf(tmpname, sizeof(tmpname), "%s.tmp", Arg.ppfname);
-			else _snprintf(tmpname, sizeof(tmpname), "%s.tmp%03d", Arg.ppfname, tryi);
-			ppf = _open(tmpname, _O_BINARY | _O_CREAT | _O_EXCL | _O_RDWR, _S_IREAD | _S_IWRITE);
-			if(ppf!=-1){
-				strncpy(temp_ppfname, tmpname, sizeof(temp_ppfname)-1);
-				temp_ppfname[sizeof(temp_ppfname)-1] = '\0';
-				using_temp = 1;
-				break;
-			} else {
-				if(errno==EEXIST) continue;
-				else break;
-			}
-		}
-		if(ppf==-1){
-			printf("Error: cannot create temp file for '%s': ", Arg.ppfname); perror("");
-			CloseAllFiles();
-			return(0);
-		}
+        char tmpname[512];
+        int tmpfd = -1;
+        using_temp = 0;
+        /* Prefer to create a temp file in the same directory as the target via GetTempFileNameA */
+        {
+            char dir[MAX_PATH];
+            strncpy(dir, Arg.ppfname, sizeof(dir)-1); dir[sizeof(dir)-1] = '\0';
+            char *p = strrchr(dir, '\\'); if (!p) p = strrchr(dir, '/');
+            if (p) *p = '\0'; else if (!GetTempPathA(MAX_PATH, dir)) { strcpy_s(dir, sizeof(dir), "."); }
+
+            if (GetTempFileNameA(dir, "ppf", 0, tmpname)) {
+                /* GetTempFileName creates the file; open it for read/write */
+                tmpfd = _open(tmpname, _O_BINARY | _O_RDWR);
+                if (tmpfd != -1) {
+                    ppf = tmpfd; /* reuse descriptor */
+                    strncpy(temp_ppfname, tmpname, sizeof(temp_ppfname)-1);
+                    temp_ppfname[sizeof(temp_ppfname)-1] = '\0';
+                    using_temp = 1;
+                } else {
+                    /* fallback to original loop below */
+                    remove(tmpname);
+                }
+            }
+        }
+        /* Fallback: try creating a named temp next to target using exclusive create loop */
+        if (!using_temp) {
+            int tryi;
+            for(tryi=0; tryi<1000; tryi++){
+                if(tryi==0) _snprintf_s(tmpname, sizeof(tmpname), _TRUNCATE, "%s.tmp", Arg.ppfname);
+                else _snprintf_s(tmpname, sizeof(tmpname), _TRUNCATE, "%s.tmp%03d", Arg.ppfname, tryi);
+                ppf = _open(tmpname, _O_BINARY | _O_CREAT | _O_EXCL | _O_RDWR, _S_IREAD | _S_IWRITE);
+                if(ppf!=-1){
+                    strncpy(temp_ppfname, tmpname, sizeof(temp_ppfname)-1);
+                    temp_ppfname[sizeof(temp_ppfname)-1] = '\0';
+                    using_temp = 1;
+                    break;
+                } else {
+                    if(errno==EEXIST) continue;
+                    else break;
+                }
+            }
+        }
+        if(ppf==-1){
+            PrintWin32ErrorFmt("Error: cannot create temp file for '%s'", Arg.ppfname);
+            CloseAllFiles();
+            return(0);
+        }
 	}
 
 
@@ -474,11 +506,12 @@ void CloseAllFiles(void){
 	   or remove it on failure/abort. */
 	if(using_temp){
 		if(patch_ok){
-			if(rename(temp_ppfname, Arg.ppfname) != 0){
-				/* Try to remove possible existing destination and retry */
-				remove(Arg.ppfname);
-				if(rename(temp_ppfname, Arg.ppfname) != 0){
-					printf("Error: cannot rename temp file '%s' to '%s': ", temp_ppfname, Arg.ppfname); perror("");
+			/* Prefer atomic replacement via MoveFileEx on Windows */
+			if (!MoveFileExA(temp_ppfname, Arg.ppfname, MOVEFILE_REPLACE_EXISTING)) {
+				/* Try to remove existing destination and retry */
+				DeleteFileA(Arg.ppfname);
+				if (!MoveFileExA(temp_ppfname, Arg.ppfname, MOVEFILE_REPLACE_EXISTING)) {
+					PrintWin32ErrorFmt("Error: cannot rename temp file '%s' to '%s'", temp_ppfname, Arg.ppfname);
 				}
 			}
 		} else {
@@ -500,8 +533,8 @@ void CloseAllFiles(void){
 int CheckIfFileId(){
 	unsigned char chkmagic[4];
 
-	_lseeki64(ppf,-6,SEEK_END);
-	_read(ppf, chkmagic, 4);
+	if (_lseeki64(ppf,-6,SEEK_END) == -1) return 0;
+	if (_read(ppf, chkmagic, 4) != 4) return 0;
 	/* The last four bytes of the END marker are ".DIZ" ('.','D','I','Z'). */
 	if(memcmp(chkmagic, ".DIZ", 4) == 0){ return(1); }
 	
@@ -515,7 +548,7 @@ int CheckIfPPF3(){
 	unsigned char chkmagic[4];
 
 	_lseeki64(ppf,0,SEEK_SET);
-	_read(ppf, chkmagic,4);
+	if (_read(ppf, chkmagic,4) != 4) return(0);
 	/* The file header starts with "PPF3" (ASCII order). */
 	if(memcmp(chkmagic, "PPF3", 4) == 0){ return(1); }
 	
@@ -528,10 +561,11 @@ void PPFShowPatchInfo(void){
 	unsigned short y;
 
 	printf("Showing patchinfo... \n");
+	// Versión (ejemplo de campo de texto fijo, si algún día se lee de archivo, filtrar)
 	printf("Version     : PPF3.0\n");
 	printf("Enc.Method  : 2\n");
 	_lseeki64(ppf,56,SEEK_SET);
-	_read(ppf, &x, 1);
+	if (_read(ppf, &x, 1) != 1) { printf("Error: failed reading patch header (imagetype)\n"); return; }
 	printf("Imagetype   : ");
 	if(x == 0){
 		printf("BIN\n");
@@ -544,7 +578,7 @@ void PPFShowPatchInfo(void){
 	}
 
 	_lseeki64(ppf,57,SEEK_SET);
-	_read(ppf, &x, 1);
+	if (_read(ppf, &x, 1) != 1) { printf("Error: failed reading patch header (validation)\n"); return; }
 	printf("Validation  : ");
 	if(!x){
 		printf("Disabled\n");
@@ -553,7 +587,7 @@ void PPFShowPatchInfo(void){
 	}
 
 	_lseeki64(ppf,58,SEEK_SET);
-	_read(ppf, &x, 1);
+	if (_read(ppf, &x, 1) != 1) { printf("Error: failed reading patch header (undo)\n"); return; }
 	printf("Undo Data   : ");
 	if(!x){
 		printf("Not available\n");
@@ -562,22 +596,33 @@ void PPFShowPatchInfo(void){
 	}
 	
 	_lseeki64(ppf,6,SEEK_SET);
-	_read(ppf, &desc, 50);
+	if (_read(ppf, &desc, 50) != 50) { printf("Error: failed reading patch description\n"); return; }
 	desc[50]=0;
 	PrintDescriptionBytes(desc);
 
-	printf("File.id_diz : ");
+	// Si hay otros campos de texto en el futuro, ejemplo de filtro seguro:
+	// _lseeki64(ppf, offset, SEEK_SET);
+	// if (_read(ppf, fieldbuf, len) == len) {
+	//     fieldbuf[len-1]=0;
+	//     // Solo imprimir bytes imprimibles y hasta el primer nulo
+	//     int i=0;
+	//     printf("CampoX      : ");
+	//     while (i<len && fieldbuf[i] && fieldbuf[i]>=32 && fieldbuf[i]<127) { putchar(fieldbuf[i]); i++; }
+	//     putchar('\n');
+	// }
+
+	printf("File_id.diz : ");
 	if(!CheckIfFileId()){
 		printf("Not available\n");
 	} else {
 		printf("Available\n");
 		_lseeki64(ppf,-2,SEEK_END);
-		_read(ppf, &y, 2);
+		if (read_le16(ppf, &y) != 0) { printf("Error: failed reading file_id length\n"); return; }
        if (y > 3072) {
 			y = 3072;
        }
 		_lseeki64(ppf,-(y+18),SEEK_END);
-		_read(ppf, &id, y);
+		if (_read(ppf, &id, y) != y) { printf("Error: failed reading file_id.diz\n"); return; }
 		id[y]=0;
 		/* Print file_id.diz content in console-aware way */
 		PrintRawTextBytes(id);
@@ -596,17 +641,17 @@ int PPFAddFileId(void){
 	if(fileidlength>3072) fileidlength=3072;
 	_lseeki64(fileid,0,SEEK_SET);
 
-	_read(fileid, &buffer, fileidlength);
+	if (_read(fileid, &buffer, fileidlength) != fileidlength) { printf("Error: failed reading file_id.diz\n"); return(1); }
 	_lseeki64(ppf,0,SEEK_END);
 
 	printf("Adding file_id.diz... "); fflush(stdout);
 
-	if((_write(ppf, &fileidstart, 18)) == -1) return(1);
-	if((_write(ppf, &buffer, fileidlength)) == -1) return(1);
-	if((_write(ppf, &fileidend, 16)) == -1) return(1);
-	if((_write(ppf, &fileidlength, 2)) == -1) return(1);
+	if (safe_write(ppf, &fileidstart, 18) != 0) return(1);
+	if (safe_write(ppf, &buffer, fileidlength) != 0) return(1);
+	if (safe_write(ppf, &fileidend, 16) != 0) return(1);
+	if (write_le16(ppf, fileidlength) != 0) return(1);
 	
-	printf("done.\n");
+	printf("Done.\n"); fflush(stdout);
 	return(0);
 }
 
