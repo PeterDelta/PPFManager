@@ -179,7 +179,7 @@ int MakePPF_Main(int argc, char **argv)
 						if (!CheckIfFileId()) {
 							PPFAddFileId();
 						} else {
-							printf("Error: patch already contains a %s\n", PPFManager_FileIdNameA());
+							printf("Error: patch already contains %s\n", PPFManager_FileIdNameA());
 						}
 						CloseAllFiles();
 						ok = 1;
@@ -620,21 +620,13 @@ void PPFShowPatchInfo(void){
 	int w = PPFManager_LabelWidth();
 
 	printf("Showing patchinfo... \n");
-	// print each header using computed width and translated label if needed
-	if (g_lang == LANG_EN) {
-		printf("%-*s : PPF3.0\n", w, "Version");
-		printf("%-*s : 2\n", w, "Enc.Method");
-	} else {
-		printf("%-*s : PPF3.0\n", w, "Versi\u00f3n");
-		printf("%-*s : 2\n", w, "M\u00e9todo Enc.");
-	}
+// print each header using computed width
+        printf("%-*s : PPF3.0\n", w, "Version");
+        printf("%-*s : 2\n", w, "Enc.Method");
 
 	_lseeki64(ppf,56,SEEK_SET);
 	if (_read(ppf, &x, 1) != 1) { printf("Error: failed reading patch header (imagetype)\n"); return; }
-	if (g_lang == LANG_EN)
-		printf("%-*s : ", w, "Imagetype");
-	else
-		printf("%-*s : ", w, "Tipo de imagen");
+	printf("%-*s : ", w, "Imagetype");
 	if(x == 0){
 		printf("BIN\n");
 	} else if(x == 1){
@@ -647,10 +639,7 @@ void PPFShowPatchInfo(void){
 
 	_lseeki64(ppf,57,SEEK_SET);
 	if (_read(ppf, &x, 1) != 1) { printf("Error: failed reading patch header (validation)\n"); return; }
-	if (g_lang == LANG_EN)
-		printf("%-*s : ", w, "Validation");
-	else
-		printf("%-*s : ", w, "Validaci\u00f3n");
+	printf("%-*s : ", w, "Validation");
 	if(!x){
 		printf("Disabled\n");
 	} else {
@@ -659,10 +648,7 @@ void PPFShowPatchInfo(void){
 
 	_lseeki64(ppf,58,SEEK_SET);
 	if (_read(ppf, &x, 1) != 1) { printf("Error: failed reading patch header (undo)\n"); return; }
-	if (g_lang == LANG_EN)
-		printf("%-*s : ", w, "Undo Data");
-	else
-		printf("%-*s : ", w, "Datos Deshacer");
+	printf("%-*s : ", w, "Undo Data");
 	if(!x){
 		printf("Not available\n");
 	} else {
@@ -693,6 +679,20 @@ void PPFShowPatchInfo(void){
 		printf("Not available\n");
 	} else {
 		printf("Available\n");
+		unsigned short y;
+		if (_lseeki64(ppf, -2, SEEK_END) != -1 && _read(ppf, &y, 2) == 2) {
+		    if (y > 3072) y = 3072;
+		    unsigned char *id = (unsigned char*)malloc(y + 1);
+		    if (id) {
+		        if (_lseeki64(ppf, -(y + 18), SEEK_END) != -1 && _read(ppf, id, y) == y) {
+		            id[y] = 0;
+		            /* print the embedded file verbatim */
+		            printf("%s", id);
+                    if (y > 0 && id[y-1] != '\n') putchar('\n');
+		        }
+		        free(id);
+		    }
+		}
 	}
 }
 

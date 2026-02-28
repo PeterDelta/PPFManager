@@ -405,8 +405,9 @@ static void SetWindowTextAndScroll(HWND hEdit, const wchar_t *text) {
     EditScrollToEnd(hEdit);
 }
 
-static BOOL ShowSaveFileDialog_COM(HWND owner, wchar_t *outFilename, size_t outSize, const wchar_t *initialDir, const wchar_t *filter, HRESULT *outHr, DWORD flags) {
+static BOOL ShowSaveFileDialog_COM(HWND owner, wchar_t *outFilename, size_t outSize, const wchar_t *initialDir, const wchar_t *filter, const wchar_t *title, HRESULT *outHr, DWORD flags) {
     if (outHr) *outHr = S_OK;
+    // set dialog title if provided
     HRESULT hrInit = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
     if (outHr) *outHr = hrInit;
     if (FAILED(hrInit)) return FALSE;
@@ -422,6 +423,10 @@ static BOOL ShowSaveFileDialog_COM(HWND owner, wchar_t *outFilename, size_t outS
     }
     if (outHr) *outHr = hr;
     if (FAILED(hr)) { CoUninitialize(); return FALSE; }
+    // apply custom title if requested
+    if (title && pfd) {
+        pfd->lpVtbl->SetTitle(pfd, title);
+    }
 
     // set existing-file requirement only on open dialog
     if (!useSave && (flags & OFN_FILEMUSTEXIST)) {
@@ -900,9 +905,17 @@ static void ShowHelpDialog(HWND hwnd) {
 // Show About dialog (modal, centered on parent)
 static void ShowAboutDialog(HWND hwnd) {
     const wchar_t *title = L"PPF Manager";
-    const wchar_t *text_es = L"\nPPF Manager 1.0 por PeterDelta\r\nBasado en fuentes PPF3 de Icarus/Paradox\r\n\r\nhttps://github.com/PeterDelta/PPFManager";
-    const wchar_t *text_en = L"\nPPF Manager 1.0 by PeterDelta\r\nBased on PPF3 sources by Icarus/Paradox\r\n\r\nhttps://github.com/PeterDelta/PPFManager";
-    const wchar_t *text = (g_lang == LANG_EN) ? text_en : text_es;
+    wchar_t buf[512];
+    if (g_lang == LANG_EN) {
+        swprintf(buf, _countof(buf),
+                 L"\nPPF Manager %hs by PeterDelta\r\nBased on PPF3 sources by Icarus/Paradox\r\n\r\nhttps://github.com/PeterDelta/PPFManager",
+                 PPF_VERSION_STR);
+    } else {
+        swprintf(buf, _countof(buf),
+                 L"\nPPF Manager %hs por PeterDelta\r\nBasado en fuentes PPF3 de Icarus/Paradox\r\n\r\nhttps://github.com/PeterDelta/PPFManager",
+                 PPF_VERSION_STR);
+    }
+    const wchar_t *text = buf;
 
     // Registrar la clase 'About' una vez
     static ATOM cls = 0;
@@ -1023,11 +1036,20 @@ static const wchar_t* tw(const char* key) {
             ? L"Select a PPF and DIZ to add.\r\n"
             : L"Selecciona PPF y DIZ para añadir.\r\n";
     if (strcmp(key, "select_create_origname") == 0)
-        return (g_lang == LANG_EN) ? L"Select the original image file.\r\n" : L"Selecciona la imagen original.\r\n";
+        return (g_lang == LANG_EN) ? L"Select the original image file.\r\n" : L"Selecciona Imagen Original.\r\n";
     if (strcmp(key, "select_create_modname") == 0)
-        return (g_lang == LANG_EN) ? L"Select the modified image file.\r\n" : L"Selecciona la imagen modificada.\r\n";
+        return (g_lang == LANG_EN) ? L"Select the modified image file.\r\n" : L"Selecciona Imagen Modificada.\r\n";
     if (strcmp(key, "select_create_ppfname") == 0)
-        return (g_lang == LANG_EN) ? L"Select an output PPF filename.\r\n" : L"Selecciona el archivo PPF de salida.\r\n";
+        return (g_lang == LANG_EN) ? L"Name the Outgoing PPF\r\n" : L"Nombre del PPF de Salida\r\n";
+    // titles for file dialogs
+    if (strcmp(key, "title_sel_orig_image") == 0)
+        return (g_lang == LANG_EN) ? L"Select original image" : L"Selecciona Imagen Original";
+    if (strcmp(key, "title_sel_mod_image") == 0)
+        return (g_lang == LANG_EN) ? L"Select modified image" : L"Selecciona Imagen Modificada";
+    if (strcmp(key, "title_sel_diz") == 0)
+        return (g_lang == LANG_EN) ? L"Select DIZ file" : L"Selecciona el DIZ a Insertar";
+    if (strcmp(key, "title_sel_ppf_apply") == 0)
+        return (g_lang == LANG_EN) ? L"Select PPF to apply" : L"Selecciona el PPF a Aplicar";
     if (strcmp(key, "select_apply_bin") == 0)
         return (g_lang == LANG_EN) ? L"Select a bin/GI/ISO image file to apply the patch to.\r\n" : L"Selecciona una imagen (BIN/GI/ISO) donde aplicar el parche.\r\n";
     if (strcmp(key, "select_apply_ppf") == 0)
@@ -1053,7 +1075,7 @@ static const wchar_t* tw(const char* key) {
     if (strcmp(key, "fileid_added") == 0)
         return (g_lang == LANG_EN) ? L"File DIZ added successfully.\n" : L"Archivo DIZ a\u00f1adido correctamente.\n";
     if (strcmp(key, "error_patch_has_fileid") == 0)
-        return (g_lang == LANG_EN) ? L"Error: patch already contains a file DIZ\n" : L"Error: el parche ya contiene un archivo DIZ\n";
+        return (g_lang == LANG_EN) ? L"Error: patch already contains %s\n" : L"Error: el parche ya contiene %s\n";
     if (strcmp(key, "filter_ppf") == 0)
         return (g_lang == LANG_EN) ? L"PPF files" : L"Archivos PPF";
     if (strcmp(key, "filter_all") == 0)
@@ -1083,7 +1105,7 @@ static const wchar_t* tw(const char* key) {
     if (strcmp(key, "undo_supported_only_ppf3") == 0)
         return (g_lang == LANG_EN) ? L"Undo function is supported by PPF3.0 only\n" : L"La funci\u00f3n deshacer solo est\u00e1 soportada por PPF3.0\n";
     if (strcmp(key, "file_id_name") == 0)
-        return (g_lang == LANG_EN) ? L"file_id.diz" : L"Archivo.diz";
+        return (g_lang == LANG_EN) ? L"file_id.diz" : L"archivo.diz";
     if (strcmp(key, "console_help") == 0) {
         /* dynamically insert localized file-id label */
         static wchar_t buf[2048];
@@ -1131,7 +1153,7 @@ static const wchar_t* tw(const char* key) {
 const wchar_t *PPFManager_FileIdNameW(void) {
     if (g_lang == LANG_EN) return L"file_id.diz";
     /* example Spanish translation; add other languages if needed */
-    if (g_lang == LANG_ES) return L"Archivo.diz";
+    if (g_lang == LANG_ES) return L"archivo.diz";
     return L"file_id.diz";
 }
 
@@ -1274,8 +1296,8 @@ static const UI_TEXT_ENTRY UI_TEXTS[] = {
     {L"menu_en", L"Inglés", L"English"},
     {L"menu_dark", L"Oscuro", L"Dark"},
     {L"menu_light", L"Claro", L"Light"},
-    {L"lbl_img", L"Imagen original", L"Original image"},
-    {L"lbl_mod", L"Imagen modificada", L"Modified image"},
+    {L"lbl_img", L"Imagen Original", L"Original Image"},
+    {L"lbl_mod", L"Imagen Modificada", L"Modified Image"},
     {L"lbl_ppf_dest", L"Archivo PPF", L"PPF file"},
     {L"lbl_diz", L"Archivo DIZ", L"DIZ file"},
     {L"lbl_desc", L"Descripción", L"Description"},
@@ -1286,7 +1308,7 @@ static const UI_TEXT_ENTRY UI_TEXTS[] = {
     {L"btn_show", L"Info Parche", L"Patch Info"},
     {L"btn_add", L"Añadir .diz", L"Add .diz"},
     {L"btn_clear", L"Limpiar", L"Clear"},
-    {L"lbl_img_apply", L"Imagen original", L"Original image"},
+    {L"lbl_img_apply", L"Imagen Original", L"Original Image"},
     {L"lbl_ppf_apply", L"Archivo PPF", L"PPF file"},
     {L"chk_revert", L"Deshacer parche", L"Undo patch"},
     {L"btn_apply", L"Aplicar Parche", L"Apply Patch"},
@@ -1754,7 +1776,7 @@ static const TranslationRule g_translation_rules[] = {
     { L"Error: cannot open file \"", L"Error: no se puede abrir el archivo \"" },
     { L"Error: cannot open file ", L"Error: no se puede abrir el archivo " },
     { L"Error: file ", L"Error: el archivo " },
-    { L"Error: patch already contains a file .diz", L"Error: el parche ya contiene un archivo .diz" },
+    { L"Error: patch already contains", L"Error: el parche ya contiene un" },
     { L"Error: cannot create temp file for", L"Error: no se puede crear archivo temporal para" },
     { L"Showing patchinfo", L"Mostrando información del parche" },
     { L"Enabled", L"Habilitado." },
@@ -3564,7 +3586,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 // Use modern COM dialog
                 {
                     HRESULT hrDlg = S_OK;
-                    if (ShowSaveFileDialog_COM(hwnd, filename, MAX_PATH, ofn.lpstrInitialDir, ofn.lpstrFilter, &hrDlg, flags)) {
+                    const wchar_t *dlgTitle = NULL;
+                    if (id == 111) dlgTitle = tw("title_sel_orig_image");
+                    else if (id == 112) dlgTitle = tw("title_sel_mod_image");
+                    else if (id == 114) dlgTitle = tw("title_sel_diz");
+                    else if (id == 113) dlgTitle = tw("select_create_ppfname");
+                    if (ShowSaveFileDialog_COM(hwnd, filename, MAX_PATH, ofn.lpstrInitialDir, ofn.lpstrFilter, dlgTitle, &hrDlg, flags)) {
                         if (hTarget) {
                             // si es el cuadro de PPF, añadir sufijo si falta
                             if (id == 113) {
@@ -3753,7 +3780,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             }
             // Use modern COM dialog
             HRESULT hrDlg = S_OK;
-            BOOL ok = ShowSaveFileDialog_COM(hwnd, filename, MAX_PATH, ofn.lpstrInitialDir, ofn.lpstrFilter, &hrDlg, OFN_FILEMUSTEXIST);
+            const wchar_t *dlgTitle = (id == 211)
+                ? tw("title_sel_orig_image")
+                : tw("title_sel_ppf_apply");
+            BOOL ok = ShowSaveFileDialog_COM(hwnd, filename, MAX_PATH, ofn.lpstrInitialDir, ofn.lpstrFilter, dlgTitle, &hrDlg, OFN_FILEMUSTEXIST);
             if (ok) {
                 if (hTarget) {
                     SetWindowTextAndScroll(hTarget, filename);
@@ -4673,7 +4703,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
                             PPFAddFileId();
                             ConsolePutW(tw("fileid_added"));
                         } else {
-                            ConsolePutW(tw("error_patch_has_fileid"));
+                            /* include the file-id label so translation works with variable */
+                            ConsolePrintfKeyMB("error_patch_has_fileid", PPFManager_FileIdNameA());
                         }
                         CloseAllFiles();
                     }

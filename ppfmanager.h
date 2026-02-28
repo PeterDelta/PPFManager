@@ -4,30 +4,40 @@
 #include <stddef.h>
 #include <stdio.h>
 
+/* versión central */
+#define PPF_VERSION_STR "1.02"
+
+/* Las macros auxiliares permanecen en caso de que otro código desee realizar la conversión */
+#define PPF_STR_HELPER(x) #x
+#define PPF_STR(x) PPF_STR_HELPER(x)
+
+
+
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-/* Shared utilities provided by PPFManager (available when building combined EXE).
-   Individual tools can keep local implementations when built standalone by defining
+/* Utilidades compartidas proporcionadas por PPFManager (disponibles al compilar el EXE combinado).
+   Las herramientas individuales pueden mantener implementaciones locales cuando se compilan de forma independiente definiendo
    BUILD_STANDALONE. */
 
-/* language helpers and constants available in both combined and standalone builds */
+/* Ayudantes de idioma y constantes disponibles tanto en compilaciones combinadas como independientes */
 
 enum { LANG_ES = 0, LANG_EN = 1 };
 
 #ifdef BUILD_STANDALONE
-/* standalone translation variable defaults to English */
+/* La variable de traducción independiente predeterminada es inglés */
 static int g_lang = LANG_EN;
-/* standalone needs its own shutdown flag; GUI sets this in combined build */
+/* La versión independiente necesita su propia bandera de cierre; la GUI la establece en la compilación combinada */
 volatile LONG g_app_closing = 0;
 #else
 extern int g_lang;
 extern volatile LONG g_app_closing;
 #endif
 
-/* helper prototypes. when building standalone they are declared static inline to match
-   the implementations later; otherwise they are normal extern declarations */
+/* prototipos de ayudantes. al compilar de forma independiente se declaran static inline para coincidir
+   con las implementaciones más adelante; de lo contrario son declaraciones extern normales */
 #ifdef BUILD_STANDALONE
 static inline const char *PPFManager_FileIdNameA(void);
 static inline const wchar_t *PPFManager_FileIdNameW(void);
@@ -47,10 +57,7 @@ int PPFManager_LabelWidth(void);
 #endif
 
 #ifndef BUILD_STANDALONE
-/* Prototypes for shared helpers (available in combined build)
-   Implementations live in PPFManager.c for the combined build. For standalone
-   builds a copy of these implementations is provided below (centralized here
-   to avoid duplication across modules). */
+/* Prototipos para ayudantes compartidos (disponibles en compilaciones combinadas). Las implementaciones se encuentran en PPFManager.c para la compilación combinada. Para compilaciones independientes, se proporciona a continuación una copia de estas implementaciones (centralizada aquí) para evitar la duplicación entre módulos.). */
 int safe_write(int fd, const void *buf, size_t count);
 int safe_read(int fd, void *buf, size_t count);
 int PromptYesNo(const char *prompt, int defaultYes);
@@ -58,10 +65,10 @@ void PrintWin32ErrorFmt(const char *fmt, ...);
 void PrintDescriptionBytes(const unsigned char *desc);
 void PrintRawTextBytes(const unsigned char *s);
 
-/* Close any files opened during patch creation/apply.  */
+/* Cierre todos los archivos abiertos durante la creación/aplicación del parche.  */
 void CloseAllFiles(void);
 
-/* Deterministic PPF helpers: explicit little-endian read/write helpers to avoid platform variance */
+/* Ayudantes PPF deterministas: ayudantes de lectura/escritura little-endian explícitos para evitar la variación de la plataforma */
 int write_le64(int fd, unsigned long long val);
 int write_le16(int fd, unsigned short val);
 int read_le64(int fd, unsigned long long *out);
@@ -69,8 +76,8 @@ int read_le16(int fd, unsigned short *out);
 #endif /* BUILD_STANDALONE */
 
 #if defined(BUILD_STANDALONE) && !defined(PPFMANAGER_IMPLEMENTATION)
-/* Standalone inline implementations (centralized). These are static inline to
-   avoid link collisions and to keep behavior identical across tools. */
+/* Implementaciones en línea independientes (centralizadas). Estas son static inline para
+   evitar colisiones de enlace y mantener el comportamiento idéntico entre herramientas. */
 
 static inline int safe_write(int fd, const void *buf, size_t count) {
     size_t written = 0;
@@ -215,7 +222,7 @@ static inline void PrintWin32ErrorFmt(const char *fmt, ...) {
     }
 }
 
-/* standalone versions of the language helpers so PrintDescriptionBytes etc. work */
+/* versiones independientes de los ayudantes de idioma para que PrintDescriptionBytes, etc. funcionen */
 static inline const wchar_t *PPFManager_FileIdNameW(void) {
     return L"FileId";
 }
@@ -244,7 +251,7 @@ static inline const char *PPFManager_AddingA(void) {
 }
 
 static inline int PPFManager_LabelWidth(void) {
-    /* copy implementation from PPFManager.c so standalone tools align correctly */
+    /* copiar la implementación de PPFManager.c para que las herramientas independientes se alineen correctamente */
     const wchar_t *d = PPFManager_DescLabelW();
     const wchar_t *f = PPFManager_FileIdNameW();
     size_t m = wcslen(d) > wcslen(f) ? wcslen(d) : wcslen(f);
@@ -308,8 +315,8 @@ static inline int read_le16(int fd, unsigned short *out) {
 }
 #endif
 
-/* Optional lightweight profiling helpers enabled at runtime via PPFMANAGER_PROFILE=1.
-   Provides perf_enabled(), perf_now(), and perf_report_ms(). Cross-platform fallback using clock(). */
+/* Ayudantes de perfilado ligero opcionales habilitados en tiempo de ejecución mediante PPFMANAGER_PROFILE=1.
+   Proporciona perf_enabled(), perf_now() y perf_report_ms(). Fallback multiplataforma usando clock(). */
 #ifndef PPFMANAGER_PROFILE_HELPERS
 #define PPFMANAGER_PROFILE_HELPERS
 #include <time.h>

@@ -306,9 +306,14 @@ void ApplyPPF2Patch(int ppf, int bin){
 	int idlen;
 	unsigned char anz;
 
-	if (_read(ppf, desc, 50) != 50) { printf("Error: failed reading patch description\n"); return; }
-	desc[50]=0;
-	PrintDescriptionBytes((unsigned char*)desc);
+    /* description lives at offset 6 (skip "PPF2" magic and method byte),
+       the same layout as PPF1.0.  A missing seek here causes the first byte of
+       the description to be the character '0' from the magic, leading to the
+       infamous leading-zero artifact.  Seek before reading just like PPF1/3.0. */
+    _lseeki64(ppf, 6, SEEK_SET);
+    if (_read(ppf, desc, 50) != 50) { printf("Error: failed reading patch description\n"); return; }
+    desc[50]=0;
+    PrintDescriptionBytes((unsigned char*)desc);
 		printf("%-12s : ", PPFManager_FileIdNameA());
 		idlen=ShowFileId(ppf);
 		if(!idlen) printf("Not available\n");
@@ -400,10 +405,23 @@ void ApplyPPF3Patch(int ppf, int bin, char mode){
     unsigned long long __perf_t0 = 0;
     if (perf_enabled()) __perf_t0 = perf_now();
 
-	if (_read(ppf, desc, 50) != 50) { printf("Error: failed reading patch description\n"); return; }
-	desc[50]=0;
-	printf("Patchfile is a PPF3.0 patch. Patch Information:\n");
-	PrintDescriptionBytes((unsigned char*)desc);
+    /* After calling PPFVersion the file pointer is left just past the 4-byte
+       magic string ("PPF3"), which means the next byte is the literal '0' that
+       follows in the 5-byte magic ("PPF30").  The description itself only
+       starts at offset 6 (skip the '0' plus the method byte).  Failing to seek
+       leaves the pointer at offset 4, causing the first byte read into `desc`
+       to be the character '0' from the magic.  That shows up as an unwanted
+       leading "0" when printing the description, e.g.:
+
+         Descripción    : 0 version 3.1 ...
+
+       Seek to the correct offset before reading to avoid this artifact.
+    */
+    _lseeki64(ppf, 6, SEEK_SET);
+    if (_read(ppf, desc, 50) != 50) { printf("Error: failed reading patch description\n"); return; }
+    desc[50]=0;
+    printf("Patchfile is a PPF3.0 patch. Patch Information:\n");
+    PrintDescriptionBytes((unsigned char*)desc);
 	printf("%-14s : ", PPFManager_FileIdNameA());
 
 	idlen=ShowFileId(ppf);

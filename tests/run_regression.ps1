@@ -331,6 +331,7 @@ $longDesc = 'Long desc'
 # Reference PPF paths: prefer to write/read from $LogDir to avoid polluting tests root
 $refPpf = Join-Path $LogDir 'out_ref.ppf'
 $refFPpf = Join-Path $LogDir 'out_ref_f.ppf'
+$refShowFileid = Join-Path $LogDir 'out_ref_show_fileid.txt'
 $refIsoPpf = Join-Path $LogDir 'out_ref_iso.ppf'
 $refLongPpf = Join-Path $LogDir 'out_ref_long.ppf'
 $refRedirectNamedPpf = Join-Path $LogDir 'out_ref_redirect_named.ppf'
@@ -411,6 +412,10 @@ if (-not (Test-Path (Join-Path $LogDir 'out_ref_show.txt'))) {
         if (-not (Test-Path (Join-Path $LogDir 'out_ref_show.txt'))) { Set-Content -Path (Join-Path $LogDir 'out_ref_show.txt') -Value "" -Encoding UTF8 }
     }
 }
+# create reference for show when fileid present
+if (-not (Test-Path $refShowFileid) -and $reference -and (Test-Path $refFPpf)) {
+    Run-ProcessCapture $reference (('s "{0}"' -f $refFPpf)) $refShowFileid 15000 | Out-Null
+}
 
 # Ensure helper scripts that used by tests exist in $LogDir (create minimal deterministic versions if missing)
 $helperNames = @('emit_long.ps1','interrupt_apply.ps1','roundtrip_binary.ps1')
@@ -439,6 +444,10 @@ $testsToRun = @()
 $testsToRun += @{ Name='create'; GuiArgs=('c -u -i 0 -d "simple test" "' + $orig + '" "' + $mod + '" "' + $out_gui + '"'); RefArgs=('c -u -i 0 -d "simple test" "' + $orig + '" "' + $mod + '" "' + $refPpf + '"'); GuiOut=(Join-Path $LogDir 'out_gui_create.txt'); RefOut=(Join-Path $LogDir 'out_ref_create.txt'); GuiOutPpf=$out_gui; RefOutPpf=$refPpf }
 $testsToRun += @{ Name='add-file'; GuiArgs=('f "' + (Join-Path $LogDir 'out_gui_f.ppf') + '" "' + $fileid + '"'); RefArgs=('f "' + $refPpf + '" "' + $fileid + '"'); GuiOut=(Join-Path $LogDir 'out_gui_add.txt'); RefOut=(Join-Path $LogDir 'out_ref_add.txt'); GuiOutPpf=(Join-Path $LogDir 'out_gui_f.ppf'); RefOutPpf=$refFPpf }
 $testsToRun += @{ Name='show'; GuiArgs=('s "' + $out_gui + '"'); RefArgs=('s "' + $refPpf + '"'); GuiOut=(Join-Path $LogDir 'out_gui_show.txt'); RefOut=(Join-Path $LogDir 'out_ref_show.txt'); TextCompare=$true }
+# show should include fileid contents
+$testsToRun += @{ Name='show-fileid'; GuiArgs=('s "' + (Join-Path $LogDir 'out_gui_f.ppf') + '"'); RefArgs=''; GuiOut=(Join-Path $LogDir 'out_gui_show_fileid.txt'); GuiOutPpf=(Join-Path $LogDir 'out_gui_f.ppf'); RefOut=$refShowFileid; RefOutPpf=$refFPpf; CheckContains='file_id content' }
+# Addition: apply the patch we created earlier and ensure description is printed
+$testsToRun += @{ Name='apply'; GuiArgs=('a "' + $orig + '" "' + $out_gui + '"'); RefArgs=''; GuiOut=(Join-Path $LogDir 'out_gui_apply.txt'); CheckContains='Patchfile is a PPF3.0 patch'; TextCompare=$true }
 # Ensure 'show' output is actually captured by GUI when using the pipe-based redirect
 $testsToRun += @{ Name='redirect-pipe-show'; GuiArgs=('s "' + $out_gui + '"'); RefArgs=''; GuiOut=(Join-Path $LogDir 'out_gui_show_pipe.txt'); CheckContains='Showing patchinfo'; TextCompare=$true }
 $testsToRun += @{ Name='iso'; GuiArgs=('c -u -i 2 -d "iso test" "' + $orig + '" "' + $mod + '" "' + (Join-Path $LogDir 'out_gui_iso.ppf') + '"'); RefArgs=('c -u -i 2 -d "iso test" "' + $orig + '" "' + $mod + '" "' + $refIsoPpf + '"'); GuiOut=(Join-Path $LogDir 'out_gui_iso.txt'); RefOut=(Join-Path $LogDir 'out_ref_iso.txt'); GuiOutPpf=(Join-Path $LogDir 'out_gui_iso.ppf'); RefOutPpf=$refIsoPpf }
@@ -627,10 +636,36 @@ foreach ($t in $testsToRun) {
     }
     if ($t.TextCompare) {
         # Special-case 'show' test: compare parsed PPF metadata instead of raw textual help
-        if ($t.Name -eq 'show') {
+        if ($t.Name -eq 'show' -or $t.Name -eq 'apply') {
+                # extra sanity check: the textual output for a PPF3 description
+                # should not begin with a spurious "0" character.  This catches the
+                # bug where ApplyPPF3Patch read the magic byte instead of skipping
+                # it (see ApplyPPF.c change).  If the pattern is detected mark the
+                # test as FAIL immediately so the regression suite notices.
+                $guiOutPath = Normalize-OutPath $t.GuiOut
+                if (Test-Path $guiOutPath) {
+                    $tmpTxt = Get-Content $guiOutPath -Raw -Encoding UTF8
+                    if ($tmpTxt -match '^\s*Description\s*:\s*0\S') {
+                        Add-Result $t.Name 'FAIL' 'description line has leading zero'
+                        continue
+                    }
+                    if ($tmpTxt -match '\[DBG\] bin seek') {
+                        Add-Result $t.Name 'FAIL' 'unexpected debug output in normal run'
+                        continue
+                    }
+                }
+                if ($t.Name -eq 'apply') {
+                    # apply has no reference comparison; we've already validated the
+                    # description line above so mark as success and continue to next
+                    $ok = $true
+                    continue
+                }
+                # fall through to show-specific parsing logic
                 $guiPpf = $out_gui
                 # prefer the canonical $refPpf defined earlier (in $LogDir)
                 if (($reference) -and (Test-Path $refPpf) -and (Test-Path $guiPpf)) {
+                }
+                if ($t.Name -eq 'show' -and ($reference) -and (Test-Path $refPpf) -and (Test-Path $guiPpf)) {
                     # Prefer parser copy in logs if present, otherwise fall back to tests root
                     $parser = if (Test-Path $parserLog) { $parserLog } elseif (Test-Path $parserSrc) { $parserSrc } else { $null }
                     if (-not $parser) {

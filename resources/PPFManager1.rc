@@ -1,2 +1,58 @@
+#pragma code_page(65001)
+#include <windows.h>
+#include <winver.h>
+#include "..\ppfmanager.h"
+
 101 ICON "PPFManager.ico"
-1 24 "PPFManager.manifest"
+
+/* Spanish manifest */
+LANGUAGE 0x0a,0x03
+1 24 "resources/PPFManager.es.manifest"
+
+/* English manifest */
+LANGUAGE 0x09,0x01
+1 24 "resources/PPFManager.manifest"
+
+LANGUAGE 0x09, 0x01    /* English - United States */
+1 VERSIONINFO
+FILEVERSION 1,0,0,0
+PRODUCTVERSION 1,0,0,0
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "CompanyName",      "PeterDelta\0"
+            VALUE "FileDescription",  "PPF file management\0"
+            VALUE "ProductName",      "PPF Manager\0"
+            VALUE "ProductVersion",   PPF_VERSION_STR "\0"
+            VALUE "LegalCopyright",   "© 2026 PeterDelta\0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
+END
+
+LANGUAGE 0x0a, 0x03    /* Spanish - Spain */
+1 VERSIONINFO
+FILEVERSION 1,0,0,0
+PRODUCTVERSION 1,0,0,0
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "0c0a04b0"
+        BEGIN
+            VALUE "CompanyName",      "PeterDelta\0"
+            VALUE "FileDescription",  "Gestión de archivos PPF\0"
+            VALUE "ProductName",      "PPF Manager\0"
+            VALUE "ProductVersion",   PPF_VERSION_STR "\0"
+            VALUE "LegalCopyright",   "© 2026 PeterDelta\0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0c0a, 1200
+    END
+END
