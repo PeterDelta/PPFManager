@@ -332,7 +332,8 @@ void ApplyPPF2Patch(int ppf, int bin){
 		{
 			long long _seekret = _lseeki64(bin, 0x9320, SEEK_SET);
 			long long _flen = _filelengthi64(bin);
-			printf("[DBG] bin seek ret=%lld filelen=%lld\n", _seekret, _flen); fflush(stdout);
+			/* Only emit diagnostic trace when PPFMANAGER_TEST=1; otherwise it pollutes the GUI output console with debug noise on every PPF2 apply. */
+			if (getenv("PPFMANAGER_TEST") && getenv("PPFMANAGER_TEST")[0] == '1') { printf("[DBG] bin seek ret=%lld filelen=%lld\n", _seekret, _flen); fflush(stdout); }
 			int _rv = _read(bin, &binblock, 1024);
 			if (_rv < 0) { printf("Warning: failed reading bin validation block (rv=%d errno=%d) - treating as zeros\n", _rv, errno); fflush(stdout); memset(binblock, 0, 1024); }
 			else if (_rv < 1024) memset(binblock + _rv, 0, 1024 - _rv);

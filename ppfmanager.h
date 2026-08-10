@@ -5,7 +5,7 @@
 #include <stdio.h>
 
 /* versión central */
-#define PPF_VERSION_STR "1.02"
+#define PPF_VERSION_STR "1.03"
 
 /* Las macros auxiliares permanecen en caso de que otro código desee realizar la conversión */
 #define PPF_STR_HELPER(x) #x
