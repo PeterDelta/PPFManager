@@ -30,6 +30,9 @@
 /* Flag from GUI indicating user requested application shutdown. */
 extern volatile LONG g_app_closing;
 
+/* Flag from GUI indicating user requested cancellation of the current operation. */
+extern volatile LONG g_cancel_requested;
+
 // Print Win32 error with formatted prefix. Uses FormatMessage to show readable system message.
 #ifndef BUILD_STANDALONE
 /* Use shared PrintWin32ErrorFmt from PPFManager */
@@ -42,6 +45,10 @@ static char bin_tmp_name[512] = {0};
 static int apply_success = 0; 
 /* Expose status to callers: 1 = last apply succeeded, 0 = failed or not attempted */
 int ApplyPPF_GetSuccess(void) { return apply_success; }
+/* Safe patching mode: when 1 (command-line "-s"/"--safe"), apply works on a temp copy of the
+   original and replaces it atomically at the end (original never corrupted). When 0 (default),
+   the original is patched in place directly for a fast start (no full-file copy). */
+static int apply_safe_patch = 0;
 #ifdef BUILD_STANDALONE
 int ppf, bin;
 char binblock[1024], ppfblock[1024];
@@ -159,13 +166,22 @@ int ApplyPPF_Main(int argc, char **argv)
 {
 	/* Install cleanup handler for console control events so interruptions do not leave temporary files. */
 	SetConsoleCtrlHandler(ApplyConsoleCtrlHandler, TRUE);
-	if(argc!=4){
-		printf("Usage: PPFManager.exe <command> <binfile> <patchfile>\n");
+	/* Optional trailing "-s"/"--safe" flag enables safe patching (temp copy + atomic replace).
+	   Default (no flag) is fast in-place patching directly on the original file. */
+	apply_safe_patch = 0;
+	if (argc == 5 && argv[4] &&
+		(strcmp(argv[4], "-s") == 0 || strcmp(argv[4], "--safe") == 0 || strcmp(argv[4], "-safe") == 0)) {
+		apply_safe_patch = 1;
+	}
+	if(argc != 4 && argc != 5){
+		printf("Usage: PPFManager.exe <command> <binfile> <patchfile> [-s]\n");
 		printf("<Commands>\n");
 		printf("  a : apply PPF1/2/3 patch\n");
 		printf("  u : undo patch (PPF3 only)\n");
 
 		printf("\nExample: PPFManager.exe a game.bin patch.ppf\n");
+		printf("Options:\n");
+		printf("  -s : safe patching (copy original to temp, replace atomically at the end)\n");
 		return(0);
 	}
 
@@ -258,7 +274,7 @@ void ApplyPPF1Patch(int ppf, int bin){
 	PrintDescriptionBytes((unsigned char*)desc);
 	printf("%-12s : no\n", PPFManager_FileIdNameA());
 
-	printf("Patching... "); fflush(stdout);
+	printf("Progress: "); fflush(stdout);
 	_lseeki64(ppf, 0, SEEK_END);
 	count = _telli64(ppf);
 	count -= 56;
@@ -272,7 +288,7 @@ void ApplyPPF1Patch(int ppf, int bin){
 	write_agg_t agg; agg_init(&agg);
 
 	do{
-		if (InterlockedCompareExchange(&g_app_closing,0,0)) { printf("Aborting apply (user closed GUI)\n"); return; }
+		if (InterlockedCompareExchange(&g_app_closing,0,0) || InterlockedCompareExchange(&g_cancel_requested,0,0)) { printf("Aborting apply (The GUI closed or stopped)\n"); return; }
 		if (count < 5) { printf("Error: patch data truncated\n"); return; }
 		_lseeki64(ppf, seekpos, SEEK_SET);
 		if (_read(ppf, &pos32, 4) != 4) { printf("Error: failed reading patch data\n"); return; }
@@ -343,7 +359,7 @@ void ApplyPPF2Patch(int ppf, int bin){
 			if (!PromptYesNo("Binblock/Patchvalidation failed. continue ? (y/n): ", 0)) { printf("Aborted...\n"); return; }
 		}
 
-		printf("Patching... "); fflush(stdout);
+		printf("Progress: "); fflush(stdout);
 		_lseeki64(ppf, 0, SEEK_END);
 	count = _telli64(ppf);
 	seekpos=1084;
@@ -358,7 +374,7 @@ void ApplyPPF2Patch(int ppf, int bin){
 	write_agg_t agg; agg_init(&agg);
 
         do{
-		if (InterlockedCompareExchange(&g_app_closing,0,0)) { printf("Aborting apply (user closed GUI)\n"); return; }
+		if (InterlockedCompareExchange(&g_app_closing,0,0) || InterlockedCompareExchange(&g_cancel_requested,0,0)) { printf("Aborting apply (The GUI closed or stopped)\n"); return; }
 		if (count < 5) { printf("Error: patch data truncated\n"); return; }
 		_lseeki64(ppf, seekpos, SEEK_SET);
 		int32_t pos32;
@@ -504,10 +520,10 @@ void ApplyPPF3Patch(int ppf, int bin, char mode){
 	/* Aggregator for output writes */
 	write_agg_t agg; agg_init(&agg);
 
-	printf("Patching ... "); fflush(stdout);
+	printf("Progress: "); fflush(stdout);
 	_lseeki64(ppf, seekpos, SEEK_SET);
 	do{
-		if (InterlockedCompareExchange(&g_app_closing,0,0)) { printf("Aborting apply (user closed GUI)\n"); return; }
+		if (InterlockedCompareExchange(&g_app_closing,0,0) || InterlockedCompareExchange(&g_cancel_requested,0,0)) { printf("Aborting apply (The GUI closed or stopped)\n"); return; }
 		/* Each PPF3 entry requires at least 9 bytes (offset 8 + size 1). */
 		if (count < 9) { printf("Error: patch entry truncated or count mismatch\n"); return; }
 		{
@@ -620,16 +636,18 @@ int PPFVersion(int ppf){
 // Return: 1 - Failed.
 int OpenFiles(char* file1, char* file2){
 
-	bin=_open(file1, _O_BINARY | _O_RDONLY);
-	if(bin==-1){
+	/* In-place mode opens the original read/write and patches it directly (fast start).
+	   Safe mode opens read-only and operates on a temp copy that replaces the original atomically. */
+	bin = _open(file1, _O_BINARY | (apply_safe_patch ? _O_RDONLY : _O_RDWR));
+	if(bin == -1){
 		PrintWin32ErrorFmt("Error: cannot open file '%s'", file1);
 		return(1);
 	}
 	strncpy(bin_orig_name, file1, sizeof(bin_orig_name)-1);
 	bin_orig_name[sizeof(bin_orig_name)-1] = '\0';
 
-	ppf=_open(file2,  _O_RDONLY | _O_BINARY);
-	if(ppf==-1){
+	ppf = _open(file2, _O_RDONLY | _O_BINARY);
+	if(ppf == -1){
 		PrintWin32ErrorFmt("Error: cannot open file '%s'", file2);
 		_close(bin);
 		return(1);
@@ -640,39 +658,51 @@ int OpenFiles(char* file1, char* file2){
 		ApplyPPF_ProgressCallback(0.0);
 	}
 
-	/* Create a temp copy of original file and operate on the temp file. This avoids corrupting the original on failure. */
-	{
+	/* Safe patching: create a temp copy of the original and operate on the temp file (the original
+	   is only replaced atomically at the end). In-place mode (default) skips the copy entirely. */
+	if (apply_safe_patch) {
 		int tmpfd = -1;
 		char tmpdir[MAX_PATH];
 		/* Try to create temp file in same directory as target */
-		strncpy(tmpdir, file1, sizeof(tmpdir)-1); tmpdir[sizeof(tmpdir)-1] = '\0';
-		char *p = strrchr(tmpdir, '\\'); if (!p) p = strrchr(tmpdir, '/');
-		if (p) *p = '\0'; else if (!GetTempPathA(MAX_PATH, tmpdir)) { strcpy_s(tmpdir, sizeof(tmpdir), "."); }
+		strncpy(tmpdir, file1, sizeof(tmpdir)-1);
+		tmpdir[sizeof(tmpdir)-1] = '\0';
+		char *p = strrchr(tmpdir, '\\');
+		if (!p) p = strrchr(tmpdir, '/');
+		if (p) *p = '\0';
+		else if (!GetTempPathA(MAX_PATH, tmpdir)) {
+			strcpy_s(tmpdir, sizeof(tmpdir), ".");
+		}
 
 		if (GetTempFileNameA(tmpdir, "ppf", 0, bin_tmp_name)) {
 			/* GetTempFileName created the file; open it for r/w */
 			tmpfd = _open(bin_tmp_name, _O_BINARY | _O_RDWR);
-			if (tmpfd == -1) { remove(bin_tmp_name); }
+			if (tmpfd == -1) {
+				remove(bin_tmp_name);
+			}
 		}
 
 		/* Fallback to original exclusive create loop if needed */
 		if (tmpfd == -1) {
 			int tryi;
-			for(tryi=0; tryi<1000; tryi++){
-			if(tryi==0) _snprintf_s(bin_tmp_name, sizeof(bin_tmp_name), _TRUNCATE, "%s.ppf_tmp", file1);
-			else _snprintf_s(bin_tmp_name, sizeof(bin_tmp_name), _TRUNCATE, "%s.ppf_tmp%03d", file1, tryi);
+			for(tryi = 0; tryi < 1000; tryi++){
+				if(tryi == 0)
+					_snprintf_s(bin_tmp_name, sizeof(bin_tmp_name), _TRUNCATE, "%s.ppf_tmp", file1);
+				else
+					_snprintf_s(bin_tmp_name, sizeof(bin_tmp_name), _TRUNCATE, "%s.ppf_tmp%03d", file1, tryi);
 				tmpfd = _open(bin_tmp_name, _O_BINARY | _O_CREAT | _O_EXCL | _O_RDWR, _S_IREAD | _S_IWRITE);
-				if(tmpfd!=-1) break;
-				if(errno!=EEXIST) break;
+				if(tmpfd != -1) break;
+				if(errno != EEXIST) break;
 			}
 		}
 
-		if(tmpfd==-1){
+		if(tmpfd == -1){
 			printf("Error: cannot create temporary file for patching: %s\n", bin_tmp_name);
-			_close(ppf); _close(bin);
+			_close(ppf);
+			_close(bin);
 			return(1);
 		}
-		/* Copy original content to temp */
+
+		/* Copy original content to temp, checking for cancellation during the copy */
 		_lseeki64(bin, 0, SEEK_SET);
 		_lseeki64(tmpfd, 0, SEEK_SET);
 		{
@@ -680,22 +710,44 @@ int OpenFiles(char* file1, char* file2){
 			int r;
 			__int64 copied = 0;
 			__int64 total = _filelengthi64(bin);
+
 			while((r = _read(bin, buf, sizeof(buf))) > 0){
+				/* Abort if user requested cancellation */
+				if (InterlockedCompareExchange(&g_cancel_requested, 0, 0)) {
+					printf("Aborting copy (user cancelled)\n");
+					_close(tmpfd);
+					remove(bin_tmp_name);
+					_close(ppf);
+					_close(bin);
+					return(1);
+				}
+
 				if (safe_write(tmpfd, buf, r) != 0) {
 					printf("Error: failed writing to temporary patch file\n");
-					_close(tmpfd); remove(bin_tmp_name); _close(ppf); _close(bin);
+					_close(tmpfd);
+					remove(bin_tmp_name);
+					_close(ppf);
+					_close(bin);
 					return(1);
 				}
 				copied += r;
-				/* bump progress a un pequeño porcentaje durante la copia */
+				/* bump progress during the copy: map the whole copy to 0..90% so the UI shows
+				   real progress while this (expensive) full-file copy runs */
 				if (ApplyPPF_ProgressCallback && total > 0) {
-					double pct = ((double)copied / (double)total) * 5.0; // hasta 5%
+					double pct = ((double)copied / (double)total) * 90.0; // hasta 90%
 					ApplyPPF_ProgressCallback(pct);
 				}
 			}
-			if (r < 0) { printf("Error: failed reading source file during temp copy\n"); _close(tmpfd); remove(bin_tmp_name); _close(ppf); _close(bin); return(1); }
+			if (r < 0) {
+				printf("Error: failed reading source file during temp copy\n");
+				_close(tmpfd);
+				remove(bin_tmp_name);
+				_close(ppf);
+				_close(bin);
+				return(1);
+			}
 		}
-		/* Close original and switch bin to temp for in-place patching */
+		/* Close original and switch bin to temp for in‑place patching */
 		_close(bin);
 		bin = tmpfd;
 		bin_is_temp = 1;

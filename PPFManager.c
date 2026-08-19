@@ -15,6 +15,7 @@
 #define GET_Y_LPARAM(lp) ((int)(short)HIWORD(lp))
 #endif
 #include <stdbool.h>
+#include <stdint.h>   // <-- LÍNEA NUEVA
 #include <locale.h>
 #include <stdarg.h>
 #include <errno.h>
@@ -391,6 +392,40 @@ int write_le16(int fd, unsigned short val) {
     return safe_write(fd, buf, 2);
 }
 
+// Bandera de cancelación compartida (definida junto a g_app_closing más abajo)
+extern volatile LONG g_cancel_requested;
+
+// --- Función para calcular CRC32 de un archivo ---
+static uint32_t crc32_file(const char *filename) {
+    static uint32_t table[256];
+    static int init = 0;
+    if (!init) {
+        for (int i = 0; i < 256; i++) {
+            uint32_t crc = i;
+            for (int j = 0; j < 8; j++)
+                crc = (crc & 1) ? (crc >> 1) ^ 0xEDB88320UL : crc >> 1;
+            table[i] = crc;
+        }
+        init = 1;
+    }
+    FILE *f = fopen(filename, "rb");
+    if (!f) return 0;
+    uint32_t crc = 0xFFFFFFFF;
+    uint8_t buf[65536];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
+        // Si el usuario pulsó Cancelar, abortar cuanto antes.
+        if (InterlockedCompareExchange(&g_cancel_requested, 0, 0)) {
+            fclose(f);
+            return 0xFFFFFFFFu; // señal de operación cancelada
+        }
+        for (size_t i = 0; i < n; i++)
+            crc = table[(crc ^ buf[i]) & 0xFF] ^ (crc >> 8);
+    }
+    fclose(f);
+    return ~crc;
+}
+
 // Ayudante: convertir cadena de filtro de estilo antiguo ("Name\0pattern\0...") a COMDLG_FILTERSPEC
 static COMDLG_FILTERSPEC *ParseFilterSpec(const wchar_t *filter, UINT *outCount) {
     if (!filter) { *outCount = 0; return NULL; }
@@ -540,6 +575,8 @@ static int g_console_attached = 0;
 #define WM_ENABLE_BROWSE (WM_APP + 101)  // wParam: 1 habilitar, 0 deshabilitar
 #define WM_CREAR_PROGRESS (WM_APP + 102) // wParam: progreso 0..10000
 #define WM_APLICAR_PROGRESS (WM_APP + 103) // wParam: progreso 0..10000
+#define WM_OPERATION_START (WM_APP + 104) // operación en curso: deshabilitar botones de acción y Reiniciar -> Cancelar
+#define WM_OPERATION_DONE  (WM_APP + 105) // operación terminada: restaurar botones de acción y texto Reiniciar
 
 // Idioma actual de la UI: 0=ES, 1=EN
 // (enumeration defined in header; avoid duplicate)
@@ -551,6 +588,7 @@ typedef struct {
     wchar_t cmdline[1024];
     char partial[4096];
     int partial_len;
+    int cancellable; // 1 = operación de Crear/Aplicar parche: deshabilitar botones de acción y permitir Cancelar
 } PROC_THREAD_PARAM;
 
 // Estilos comunes para que todos los botones/checkbox usen apariencia nativa de Windows y el foco de teclado
@@ -582,6 +620,7 @@ int using_temp = 0;
 int patch_ok = 0;
 static volatile LONG g_operation_running = 0; // Flag to prevent concurrent operations
 volatile LONG g_app_closing = 0;   // set when the GUI is closing, signals worker threads to abort
+volatile LONG g_cancel_requested = 0; // set when the user presses Cancelar/Reiniciar during an operation
 
 // Declaraciones adelantadas para funciones de ApplyPPF.c y MakePPF.c
 extern int ApplyPPF_Main(int argc, char **argv);
@@ -644,11 +683,12 @@ static void SetTitleBarDark(HWND hwnd, bool enable) {
     FreeLibrary(hDwm);
 }
 
-static void UpdateCheckboxThemes(bool dark, HWND chkUndo, HWND chkValid, HWND chkRevert) {
+static void UpdateCheckboxThemes(bool dark, HWND chkUndo, HWND chkValid, HWND chkRevert, HWND chkSafe) {
     const wchar_t *theme = dark ? L"DarkMode_Explorer" : NULL;
     if (chkUndo) SetWindowTheme(chkUndo, theme, NULL);
     if (chkValid) SetWindowTheme(chkValid, theme, NULL);
     if (chkRevert) SetWindowTheme(chkRevert, theme, NULL);
+    if (chkSafe) SetWindowTheme(chkSafe, theme, NULL);
 }
 
 static void UpdateButtonThemes(bool dark, HWND *btns, int count) {
@@ -742,7 +782,7 @@ static void UpdatePanelEdge(HWND panel) {
 }
 
 static void ApplyCurrentTheme(bool dark, HWND hwnd, HWND hwndTab, HWND hCrearPanel, HWND hAplicarPanel,
-    HWND chkUndo, HWND chkValid, HWND chkRevert, HMENU hMenuBar) {
+    HWND chkUndo, HWND chkValid, HWND chkRevert, HWND chkSafe, HMENU hMenuBar) {
     UpdateThemeBrushes(dark);
     SetTitleBarDark(hwnd, dark);
     if (hwndTab) {
@@ -767,7 +807,7 @@ static void ApplyCurrentTheme(bool dark, HWND hwnd, HWND hwndTab, HWND hCrearPan
     // Quitar borde 3D en paneles en modo oscuro para que no se vean claros
     UpdatePanelEdge(hCrearPanel);
     UpdatePanelEdge(hAplicarPanel);
-    UpdateCheckboxThemes(dark, chkUndo, chkValid, chkRevert);
+    UpdateCheckboxThemes(dark, chkUndo, chkValid, chkRevert, chkSafe);
     if (hMenuBar) {
         UpdateThemeMenuChecks(hMenuBar, dark);
         UpdateLanguageMenuChecks(hMenuBar);
@@ -819,7 +859,7 @@ static void AplicarProgress_ResetToZero(void) {
 
 // Umbral de publicación de progreso (0..10000): evita desbordar la cola de mensajes de la UI
 // cuando ApplyPPF/MakePPF reportan progreso muy a menudo (PostMessageW falla en ese caso).
-#define PROGRESS_POST_STEP 100 // publicar como máximo cada 1% de avance (100/10000)
+#define PROGRESS_POST_STEP 500 // publicar como máximo cada 1% de avance (100/10000)
 
 // Publicador de progreso de la callback de MakePPF (usa g_hwndMain).
 // Estado compartido con la UI: volatile LONG + Interlocked.
@@ -873,7 +913,7 @@ static void GuiApplyProgress(double pct) {
 static void ResetAppToFreshState(HWND hCrearOutput, HWND hAplicarOutput,
     HWND hCrearEditImg, HWND hCrearEditMod, HWND hCrearEditPPF, HWND hCrearEditDIZ, HWND hCrearEditDesc,
     HWND hAplicarEditImg, HWND hAplicarEditPPF,
-    HWND hCrearChkUndo, HWND hCrearChkValid, HWND hAplicarChkRevert,
+    HWND hCrearChkUndo, HWND hCrearChkValid, HWND hAplicarChkRevert, HWND hAplicarChkSafe,
     HWND hCrearComboTipo) {
     // Ventanas de salida
     if (hCrearOutput) SetWindowTextW(hCrearOutput, L"");
@@ -890,6 +930,7 @@ static void ResetAppToFreshState(HWND hCrearOutput, HWND hAplicarOutput,
     if (hCrearChkUndo) SendMessageW(hCrearChkUndo, BM_SETCHECK, BST_UNCHECKED, 0);
     if (hCrearChkValid) SendMessageW(hCrearChkValid, BM_SETCHECK, BST_CHECKED, 0);
     if (hAplicarChkRevert) SendMessageW(hAplicarChkRevert, BM_SETCHECK, BST_UNCHECKED, 0);
+    if (hAplicarChkSafe) SendMessageW(hAplicarChkSafe, BM_SETCHECK, BST_UNCHECKED, 0);
     if (hCrearComboTipo) SendMessageW(hCrearComboTipo, CB_SETCURSEL, 0, 0);
     // Barras de progreso a cero
     CrearProgress_ResetToZero();
@@ -1434,15 +1475,19 @@ static const UI_TEXT_ENTRY UI_TEXTS[] = {
     {L"btn_add", L"Añadir .diz", L"Add .diz"},
     {L"btn_clear", L"Limpiar", L"Clear"},
     {L"btn_reset", L"Reiniciar", L"Reset"},
+    {L"btn_cancel", L"Cancelar", L"Cancel"},
     {L"lbl_img_apply", L"Imagen Original", L"Original Image"},
     {L"lbl_ppf_apply", L"Archivo PPF", L"PPF file"},
     {L"chk_revert", L"Deshacer parche", L"Undo patch"},
+    {L"chk_safe_patch", L"Parcheo seguro", L"Safe patching"},
     {L"btn_apply", L"Aplicar Parche", L"Apply Patch"},
     {L"btn_clear_apply", L"Limpiar", L"Clear"},
     {L"btn_reset_apply", L"Reiniciar", L"Reset"},
     {L"lbl_salida_apply", L" ", L" "},
     {L"help_title", L"Ayuda de PPFManager", L"PPFManager Help"},
-    {L"help_interface", L"Los archivos se pueden arrastrar a la ruta de dirección o buscarlos manualmente.\n\nPestaña Crear Parche:\n  - Imagen original — Seleccionar la imagen sin modificar.\n  - Imagen modificada — Seleccionar la imagen modificada.\n  - Archivo PPF — Elegir el nombre del parche, se agrega automáticamente al añadir la Imagen original.\n  - Archivo DIZ (opcional) — Archivo que contiene texto informativo del parche y se inserta dentro del .ppf\n  - Descripción (opcional) — Añade una descripción y se inserta dentro del .ppf\n    Opciones:\n  - Incluir datos deshacer — Incluye información para revertir los cambios realizados y devolver la imagen original.\n  - Activar validación — Protección para asegurar que no se pueda aplicar el parche en una imagen diferente\n  - Imagen — Elegir tipo de imagen .bin .gi .iso\n  - Botón Crear Parche — Ejecuta la creación del parche en la ubicacion establecida.\n  - Botón Info Parche — Muestra la información del .ppf agregado en el campo 'Archivo PPF'.\n  - Botón Añadir .diz — Añade un archivo.diz al parche.\n  - Botón Limpiar — Limpia la salida de la consola.\n  - Botón Reiniciar — Reinicia la aplicación al estado inicial.\n\nPestaña Aplicar Parche:\n  - Imagen original — Seleccionar la imagen original\n  - Archivo PPF — Seleccionar el parche para aplicar en la imagen\n  - Deshacer parche — Revierte la aplicación del parche. (El .ppf tiene que haber sido creado con estos datos)", L"Files can be dragged to the address path or searched for manually.\n\nCreate Patch tab:\n  - Original image — Select the unmodified image.\n  - Modified image — Select the modified image.\n  - PPF file — Choose the patch name, it is added automatically when selecting the Original image.\n  - File.diz (optional) — File that contains informative text about the patch and is inserted inside the .ppf\n  - Description (optional) — Adds a description and is inserted inside the .ppf\n    Options:\n  - Include undo data — Includes information to revert the changes made and restore the original image.\n  - Enable validation — Protection to ensure that the patch cannot be applied to a different image\n  - Image — Choose image type .bin .gi .iso\n  - Create Patch button — Executes the patch creation at the established location.\n  - Patch Info button — Displays the .ppf file information added in the 'PPF file' field.\n  - Add file.diz button — Adds a file.diz file to the patch.\n  - Clear button — Clears the console output.\n  - Reset button — Resets the application to its initial state.\n\nApply Patch tab:\n  - Original image — Select the original image\n  - PPF file — Select the patch to apply to the image\n  - Undo patch — Reverts the application of the patch. (The .ppf must have been created with these data)\n"},
+    {L"help_interface", L"Los archivos se pueden arrastrar a la ruta de dirección o buscarlos manualmente.\n\nPestaña Crear Parche:\n  - Imagen original — Seleccionar la imagen sin modificar.\n  - Imagen modificada — Seleccionar la imagen modificada.\n  - Archivo PPF — Elegir el nombre del parche, se agrega automáticamente al añadir la Imagen original.\n  - Archivo DIZ (opcional) — Archivo que contiene texto informativo para insertarlo en el .ppf\n  - Descripción (opcional) — Añade una descripción y se inserta dentro del .ppf\n    Opciones:\n  - Incluir datos de deshacer — Inserta datos para poder devolver la imagen original (ocupa el doble).\n  - Activar validación — Protección para asegurar que no se pueda aplicar el parche en una imagen diferente\n  - Imagen — Elegir tipo de imagen .bin .gi .iso\n  - Botón Crear Parche — Ejecuta la creación del parche en la ubicacion establecida.\n  - Botón Info Parche — Muestra la información del .ppf agregado en el campo 'Archivo PPF'.\n  - Botón Añadir .diz — Inserta el archivo.diz al parche.\n  - Botón Limpiar — Limpia el texto de la salida de la consola.\n  - Botón Reiniciar — Reinicia la aplicación al estado inicial.\n\nPestaña Aplicar Parche:\n  - Imagen original — Seleccionar la imagen original\n  - Archivo PPF — Seleccionar el parche para aplicar en la imagen\n  - Deshacer parche — Devuelve a la imagen original. (El .ppf tiene que haber sido creado con estos datos)\n  - Parcheo seguro — Asegura que no se corrompa la imagen haciendo una copia temporal (proceso más lento).\n  - Botón Ver CRC — Muestra el cálculo CRC del archivo seleccionado.\n", L"Files can be dragged to the address path or searched for manually.\n\nCreate Patch tab:\n  - Original image — Select the unmodified image.\n  - Modified image — Select the modified image.\n  - PPF file — Choose the patch name, it is added automatically when selecting the Original image.\n  - File.diz (optional) — File that contains informative text about the patch and is inserted inside the .ppf\n  - Description (optional) — Adds a description and is inserted inside the .ppf\n    Options:\n  - Include undo data — Insert data to be able to return the original image (it takes up twice the space).\n  - Enable validation — Protection to ensure that the patch cannot be applied to a different image\n  - Image — Choose image type .bin .gi .iso\n  - Create Patch button — Executes the patch creation at the established location.\n  - Patch Info button — Displays the .ppf file information added in the 'PPF file' field.\n  - Add file.diz button — Adds a file.diz file to the patch.\n  - Clear button — Clears the text of the console output.\n  - Reset button — Resets the application to its initial state.\n\nApply Patch tab:\n  - Original image — Select the original image\n  - PPF file — Select the patch to apply to the image\n  - Undo patch — Returns to the original image. (The .ppf must have been created with these data)\n  - Safe patching — Ensure that the image is not corrupted by making a temporary copy (slower process).\n  - View CRC button — Displays the CRC calculation of the selected file.\n"},
+    {L"btn_crc", L"Ver CRC", L"View CRC"},
+    {L"crc_cancelled", L"CRC32: operación cancelada.\r\n", L"CRC32: operation cancelled.\r\n"},
 };
 static const wchar_t* T(const wchar_t* id) {
     for (size_t i = 0; i < sizeof(UI_TEXTS)/sizeof(UI_TEXTS[0]); ++i) {
@@ -1456,7 +1501,7 @@ static const wchar_t* T(const wchar_t* id) {
 static void TranslateUI(HWND hwndTab, HWND hCrearPanel, HWND hAplicarPanel,
     HWND hCrearLblImg, HWND hCrearLblMod, HWND hCrearLblPPF, HWND hCrearLblDIZ, HWND hCrearLblDesc,
     HWND hCrearChkUndo, HWND hCrearChkValid, HWND hCrearLblTipo, HWND hCrearComboTipo, HWND hCrearBtnCrear, HWND hCrearBtnShow, HWND hCrearBtnAdd, HWND hCrearBtnClear, HWND hCrearBtnReset, HWND hCrearLblSalida,
-    HWND hAplicarLblImg, HWND hAplicarLblPPF, HWND hAplicarChkRevert, HWND hAplicarBtnApply, HWND hAplicarBtnClear, HWND hAplicarBtnReset, HWND hAplicarLblSalida,
+    HWND hAplicarLblImg, HWND hAplicarLblPPF, HWND hAplicarChkRevert, HWND hAplicarChkSafe, HWND hAplicarBtnApply, HWND hAplicarBtnClear, HWND hAplicarBtnReset, HWND hAplicarLblSalida,
     HMENU hMenuBar, HMENU hMenuIdioma, HMENU hMenuTema, HMENU hMenuAyuda) {
     // Tabs
     (void)hCrearLblSalida;
@@ -1479,7 +1524,8 @@ static void TranslateUI(HWND hwndTab, HWND hCrearPanel, HWND hAplicarPanel,
     SetWindowTextW(hCrearBtnShow, T(L"btn_show"));
     SetWindowTextW(hCrearBtnAdd, T(L"btn_add"));
     SetWindowTextW(hCrearBtnClear, T(L"btn_clear"));
-    SetWindowTextW(hCrearBtnReset, T(L"btn_reset"));
+    // Si hay una operación en curso el botón Reiniciar muestra "Cancelar"
+    SetWindowTextW(hCrearBtnReset, InterlockedCompareExchange(&g_operation_running, 0, 0) ? T(L"btn_cancel") : T(L"btn_reset"));
     // "Salida" label removed; no text to set here
     // Combo tipo
     SendMessageW(hCrearComboTipo, CB_RESETCONTENT, 0, 0);
@@ -1491,9 +1537,11 @@ static void TranslateUI(HWND hwndTab, HWND hCrearPanel, HWND hAplicarPanel,
     SetWindowTextW(hAplicarLblImg, T(L"lbl_img_apply"));
     SetWindowTextW(hAplicarLblPPF, T(L"lbl_ppf_apply"));
     SetWindowTextW(hAplicarChkRevert, T(L"chk_revert"));
+    SetWindowTextW(hAplicarChkSafe, T(L"chk_safe_patch"));
     SetWindowTextW(hAplicarBtnApply, T(L"btn_apply"));
     SetWindowTextW(hAplicarBtnClear, T(L"btn_clear_apply"));
-    SetWindowTextW(hAplicarBtnReset, T(L"btn_reset_apply"));
+    // Si hay una operación en curso el botón Reiniciar muestra "Cancelar"
+    SetWindowTextW(hAplicarBtnReset, InterlockedCompareExchange(&g_operation_running, 0, 0) ? T(L"btn_cancel") : T(L"btn_reset_apply"));
     SetWindowTextW(hAplicarLblSalida, T(L"lbl_salida_apply"));
     // Menús
     ModifyMenuW(hMenuBar, 0, MF_BYPOSITION | MF_STRING, (UINT_PTR)hMenuIdioma, T(L"menu_lang"));
@@ -1583,7 +1631,8 @@ static void BuildCreateCmdLine(wchar_t *out, size_t outSize, HWND hImg, HWND hMo
 }
 
 // Build command line for Apply operation from controls
-static void BuildApplyCmdLine(wchar_t *out, size_t outSize, HWND hImg, HWND hPPF, HWND hChkRevert) {
+static void BuildApplyCmdLine(wchar_t *out, size_t outSize, HWND hImg, HWND hPPF, HWND hChkRevert, HWND hChkSafe) {
+    (void)out; (void)outSize; (void)hImg; (void)hPPF; (void)hChkRevert; (void)hChkSafe;
     if (!out) return;
     out[0] = 0;
     wcscpy(out, L"ApplyPPF");
@@ -1596,6 +1645,10 @@ static void BuildApplyCmdLine(wchar_t *out, size_t outSize, HWND hImg, HWND hPPF
     wchar_t buf[MAX_PATH+4];
     if (hImg && GetWindowTextW(hImg, buf, MAX_PATH)) AppendQuotedArg(out, outSize, buf);
     if (hPPF && GetWindowTextW(hPPF, buf, MAX_PATH)) AppendQuotedArg(out, outSize, buf);
+    // Safe patching: trailing flag tells ApplyPPF to use a temp copy + atomic replace
+    if (hChkSafe && (SendMessageW(hChkSafe, BM_GETCHECK, 0, 0) == BST_CHECKED)) {
+        wcscat_s(out, outSize, L" -s");
+    }
 }
 
 // Extract parent folder (directory) from a path into out (including no trailing slash)
@@ -1663,7 +1716,7 @@ static void GetSettingsFilePath(wchar_t *out, size_t outSize) {
 
 // Load settings from INI and populate controls (tolerant)
 static void LoadSettings(HWND hCrearEditImg, HWND hCrearEditMod, HWND hCrearEditPPF, HWND hCrearEditDIZ, HWND hCrearEditDesc, HWND hCrearChkUndo, HWND hCrearChkValid, HWND hCrearComboTipo,
-                         HWND hAplicarEditImg, HWND hAplicarEditPPF, HWND hAplicarChkRevert) {
+                         HWND hAplicarEditImg, HWND hAplicarEditPPF, HWND hAplicarChkRevert, HWND hAplicarChkSafe) {
     wchar_t inipath[MAX_PATH];
     // Parámetros intencionalmente no usados (se mantienen por compatibilidad de firma)
     (void)hCrearEditImg; (void)hCrearEditMod; (void)hCrearEditPPF; (void)hCrearEditDIZ; (void)hAplicarEditImg; (void)hAplicarEditPPF; 
@@ -1676,6 +1729,9 @@ static void LoadSettings(HWND hCrearEditImg, HWND hCrearEditMod, HWND hCrearEdit
     if (hCrearComboTipo) SendMessageW(hCrearComboTipo, CB_SETCURSEL, 0, 0);
     // Aplicar: do NOT restore saved paths. Ensure revert checkbox is unchecked by default.
     if (hAplicarChkRevert) SendMessageW(hAplicarChkRevert, BM_SETCHECK, BST_UNCHECKED, 0);
+    // Parcheo seguro: restaurar la preferencia guardada (por defecto desactivado).
+    if (hAplicarChkSafe) SendMessageW(hAplicarChkSafe, BM_SETCHECK,
+        GetPrivateProfileIntW(L"Window", L"SafePatch", 0, inipath) ? BST_CHECKED : BST_UNCHECKED, 0);
     // Restaurar solo la posición de la ventana si está presente (no el tamaño)
     {
         int hasPos = GetPrivateProfileIntW(L"Window", L"HasPos", 0, inipath);
@@ -1720,7 +1776,7 @@ static void LoadSettings(HWND hCrearEditImg, HWND hCrearEditMod, HWND hCrearEdit
 
 // Save settings from controls to INI
 static void SaveSettings(HWND hCrearEditImg, HWND hCrearEditMod, HWND hCrearEditPPF, HWND hCrearEditDIZ, HWND hCrearEditDesc, HWND hCrearChkUndo, HWND hCrearChkValid, HWND hCrearComboTipo,
-                         HWND hAplicarEditImg, HWND hAplicarEditPPF, HWND hAplicarChkRevert) {
+                         HWND hAplicarEditImg, HWND hAplicarEditPPF, HWND hAplicarChkRevert, HWND hAplicarChkSafe) {
     wchar_t inipath[MAX_PATH];
     // Ninguno de los parámetros de control se persiste; marcarlos explícitamente como no usados
     (void)hCrearEditImg; (void)hCrearEditMod; (void)hCrearEditPPF; (void)hCrearEditDIZ; (void)hCrearEditDesc; (void)hCrearChkUndo; (void)hCrearChkValid; (void)hCrearComboTipo; (void)hAplicarEditImg; (void)hAplicarEditPPF; (void)hAplicarChkRevert;
@@ -1757,6 +1813,13 @@ static void SaveSettings(HWND hCrearEditImg, HWND hCrearEditMod, HWND hCrearEdit
         wchar_t tbuf[4];
         _snwprintf_s(tbuf, 4, _TRUNCATE, L"%d", g_themePref ? 1 : 0);
         WritePrivateProfileStringW(L"Window", L"ThemeDark", tbuf, inipath);
+    }
+    // Save Safe patching preference (pestaña Aplicar)
+    {
+        int safePatch = (hAplicarChkSafe && (SendMessageW(hAplicarChkSafe, BM_GETCHECK, 0, 0) == BST_CHECKED)) ? 1 : 0;
+        wchar_t sbuf2[4];
+        _snwprintf_s(sbuf2, 4, _TRUNCATE, L"%d", safePatch);
+        WritePrivateProfileStringW(L"Window", L"SafePatch", sbuf2, inipath);
     }
 }
 
@@ -1943,24 +2006,24 @@ static const TranslationRule g_translation_rules[] = {
     { L"Error: file ", L"Error: el archivo " },
     { L"Error: patch already contains", L"Error: el parche ya contiene un" },
     { L"Error: cannot create temp file for", L"Error: no se puede crear archivo temporal para" },
+    { L"Error: failed while collecting changes or it was canceled", L"Error: fallo al recopilar los cambios o se canceló" },
     { L"Showing patchinfo", L"Mostrando información del parche" },
     { L"Enabled", L"Habilitado." },
     { L"Disabled", L"Deshabilitado." },
     { L"Done.", L"Completado." },
-    { L"Patching...", L"Parcheando..." },
-    { L"Patching ...", L"Parcheando ..." },
     { L"Patch Information:", L"Información del parche:" },
     { L"Patchfile is a PPF3.0 patch.", L"El archivo es un parche PPF3.0." },
     { L"Patchfile is a PPF1.0 patch. Patch Information:", L"El archivo es un parche PPF1.0. Información del parche:" },
     { L"Patchfile is a PPF2.0 patch. Patch Information:", L"El archivo es un parche PPF2.0. Información del parche:" },
     { L"The size of the bin file isn't correct, continue ? (y/n): ", L"El tamaño del archivo bin no es correcto, \u00BFcontinuar? (s/n): " },
-    { L"Binblock/Patchvalidation failed. ISO images sometimes require validation disabled (-x). continue ? (y/n): ", L"La validaci\u00f3n del bloque bin fall\u00f3. Las im\u00e1genes ISO a veces requieren desactivar la validaci\u00f3n (-x). \u00BFContinuar? (s/n): " },
-    { L"Binblock/Patchvalidation failed. continue ? (y/n): ", L"La validaci\u00f3n del bloque bin fall\u00f3. \u00BFContinuar? (s/n): " },
+    { L"Binblock/Patchvalidation failed. ISO images sometimes require validation disabled (-x). continue ? (y/n): ", L"La validaci\u00f3n del bloque .bin fall\u00f3. Las im\u00e1genes ISO a veces requieren desactivar la validaci\u00f3n (-x). \u00BFContinuar? (s/n): " },
+    { L"Binblock/Patchvalidation failed. continue ? (y/n): ", L"La validaci\u00f3n del bloque .bin fall\u00f3. \u00BFContinuar? (s/n): " },
     { L"Not available", L"No disponible" },
     { L"Available", L"Disponible" },
     { L"unknown command", L"Comando desconocido" },
     { L"Executing:", L"Ejecutando:" },
     { L"Aborted...", L"Abortado..." },
+    { L"Aborting apply (The GUI closed or stopped)", L"Abortando aplicación (se cerró la GUI o se detuvo)" },
     { L"Usage: PPF <command> [-<sw> [-<sw>...]] <original bin> <modified bin> <ppf>", L"Uso: PPF <comando> [-<sw> [-<sw>...]] <Imagen original> <Imagen modificado> <ppf>" },
     { L"<Commands>", L"<Comandos>" },
     { L"  c : create PPF3.0 patch            f : add file .diz", L"  c : crear parche PPF3.0            f : añadir archivo .diz" },
@@ -1975,7 +2038,8 @@ static const TranslationRule g_translation_rules[] = {
     { L"          PPF f patch.ppf myfileid.diz", L"          PPF f patch.ppf fileid.diz" },
     { L"Usage: PPFManager.exe <command> <binfile> <patchfile>", L"Uso: PPFManager.exe <comando> <archivo bin> <archivo parche>" },
     { L"  a : apply PPF1/2/3 patch", L"  a : aplicar parche PPF1/2/3" },
-    { L"  u : undo patch (PPF3 only)", L"  u : deshacer parche (solo PPF3)" }
+    { L"  u : undo patch (PPF3 only)", L"  u : deshacer parche (solo PPF3)" },
+    { L"Aborting copy (user cancelled)", L"Cancelando la copia (cancelado por el usuario)." },
 };
 
 // Pares de etiquetas centralizados y deduplicados usados para reemplazos que preservan etiquetas y alineación.
@@ -2498,6 +2562,7 @@ static DWORD WINAPI IntegratedExecutionThread(LPVOID lpParam) {
     HWND postTarget = g_hwndMain ? g_hwndMain : GetForegroundWindow();
     int stdout_redirected = 0;
     int lock_acquired = 0;
+    int opCancellable = p ? p->cancellable : 0;
 
     enum { MAX_GUI_ARGS = 64 };
     char *argv[MAX_GUI_ARGS];
@@ -2506,14 +2571,16 @@ static DWORD WINAPI IntegratedExecutionThread(LPVOID lpParam) {
     ZeroMemory(argv, sizeof(argv));
     ZeroMemory(wargv, sizeof(wargv));
     
-    // Check if another operation is already running
+    // Check if another operation is already running (los botones de acción ya se deshabilitan en la UI)
     if (InterlockedCompareExchange(&g_operation_running, 1, 0) != 0) {
-        wchar_t *warn = _wcsdup(L"⚠️ Operación ya en curso. Por favor espera a que termine.\r\n\r\n");
-        SafePostAllocatedString(postTarget, WM_APPEND_OUTPUT, (WPARAM)p->hEdit, warn);
         free(p);
         return 1;
     }
     lock_acquired = 1;
+
+    // Limpiar cualquier cancelación previa y avisar a la UI de que hay una operación en curso.
+    InterlockedExchange(&g_cancel_requested, 0);
+    if (opCancellable) PostMessageW(postTarget, WM_OPERATION_START, 0, 0);
     
     // Parse command line to extract argc/argv
     wchar_t cmdline[1024];
@@ -2576,38 +2643,11 @@ static DWORD WINAPI IntegratedExecutionThread(LPVOID lpParam) {
         free(shortbuf);
     }
     
-    // Redirect stdout to buffer
-    char temp_stdout_path[MAX_PATH] = {0};
-    char temp_stderr_path[MAX_PATH] = {0};
-    
-    // Get temp directory and create secure temp files via Win32 API
-    char temp_dir[MAX_PATH];
-    if (GetTempPathA(MAX_PATH, temp_dir) > 0) {
-        // Create unique temp file names (GetTempFileName creates the file atomically)
-        if (GetTempFileNameA(temp_dir, "PPF", 0, temp_stdout_path) && GetTempFileNameA(temp_dir, "PPF", 0, temp_stderr_path)) {
-            // Redirigir stdout y stderr al MISMO archivo temporal (stderr en modo append).
-            // Antes se usaban archivos distintos y temp_stderr_path nunca se leía: los
-            // mensajes escritos a stderr se perdían silenciosamente en la GUI.
-            FILE *fout = freopen(temp_stdout_path, "w+b", stdout);
-            FILE *ferr = freopen(temp_stdout_path, "a+b", stderr);
-            if (fout && ferr) {
-                stdout_redirected = 1;
-                setvbuf(stdout, NULL, _IONBF, 0);
-                setvbuf(stderr, NULL, _IONBF, 0);
-            } else {
-                // If freopen failed, close any partially opened handles and remove files
-                if (fout) fclose(fout);
-                if (ferr) fclose(ferr);
-                DeleteFileA(temp_stdout_path);
-                DeleteFileA(temp_stderr_path);
-                temp_stdout_path[0] = '\0'; temp_stderr_path[0] = '\0';
-            }
-        }
-    }
+StdoutRedirect redirect = {0};
+stdout_redirected = RedirectStdout(&redirect);
+
     
     if (!stdout_redirected) {
-        // Alternativa: llamar directamente sin captura
-        // No es lo ideal, pero mejor que fallar por completo
     }
     
     // Determine which command to execute
@@ -2661,73 +2701,17 @@ static DWORD WINAPI IntegratedExecutionThread(LPVOID lpParam) {
     }
     
     // Restore stdout/stderr if redirected
-    if (stdout_redirected) {
-        fflush(stdout);
-        fflush(stderr);
-        fclose(stdout);
-        fclose(stderr);
-        
-        // Read captured output
-        FILE *read_out = fopen(temp_stdout_path, "rb");
-        if (read_out) {
-            fseek(read_out, 0, SEEK_END);
-            long size64 = ftell(read_out);
-            fseek(read_out, 0, SEEK_SET);
-            
-            if (size64 > 0 && size64 < 10*1024*1024) {
-                char *buffer = (char*)malloc((size_t)size64 + 1);
-                if (buffer) {
-                    size_t nread = fread(buffer, 1, (size_t)size64, read_out);
-                    buffer[nread] = 0;
-                    
-                    // Process line by line
-                    char *line_start = buffer;
-                    char *line_end = buffer;
-                    while (*line_end) {
-                        if (*line_end == '\n' || *line_end == '\r') {
-                            char delim = *line_end;
-                            *line_end = 0;
-                            if (line_start < line_end) {
-                                // Convert to wide char
-                                int wlen = MultiByteToWideChar(CP_UTF8, 0, line_start, -1, NULL, 0);
-                                int used_cp = CP_UTF8;
-                                if (wlen <= 0) {
-                                    wlen = MultiByteToWideChar(CP_ACP, 0, line_start, -1, NULL, 0);
-                                    used_cp = CP_ACP;
-                                }
-                                if (wlen > 0) {
-                                    wchar_t *wline = (wchar_t*)malloc(wlen * sizeof(wchar_t));
-                                    if (wline) {
-                                        MultiByteToWideChar(used_cp, 0, line_start, -1, wline, wlen);
-                                        wchar_t *filtered = TranslateConsoleLine(wline);
-                                        free(wline);
-                                        if (filtered) {
-                                            size_t wlen_final = wcslen(filtered) + 3;
-                                            wchar_t *wline_nl = (wchar_t*)malloc(wlen_final * sizeof(wchar_t));
-                                            if (wline_nl) {
-                                                wcscpy_s(wline_nl, wlen_final, filtered);
-                                                wcscat_s(wline_nl, wlen_final, L"\r\n");
-                                                SafePostAllocatedString(postTarget, WM_APPEND_OUTPUT, (WPARAM)p->hEdit, wline_nl);
-                                            }
-                                            free(filtered);
-                                        }
-                                    }
-                                }
-                            }
-                            line_start = line_end + 1;
-                            // Nota: *line_end ya se puso a 0 arriba; usamos `delim` capturado.
-                            // (El código anterior comprobaba *line_end == '\r' después de
-                            //  ponerlo a 0, por lo que la rama CRLF nunca se ejecutaba.)
-                            if (delim == '\r' && *(line_end + 1) == '\n') {
-                                line_end++;
-                                line_start++;
-                            }
-                        }
-                        line_end++;
-                    }
-                    
-                    // Last line without newline
+        if (stdout_redirected) {
+        RestoreStdout(&redirect);
+        if (redirect.buffer && redirect.buffer[0]) {
+            char *line_start = redirect.buffer;
+            char *line_end = redirect.buffer;
+            while (*line_end) {
+                if (*line_end == '\n' || *line_end == '\r') {
+                    char delim = *line_end;
+                    *line_end = 0;
                     if (line_start < line_end) {
+                        // Convertir y traducir línea igual que antes
                         int wlen = MultiByteToWideChar(CP_UTF8, 0, line_start, -1, NULL, 0);
                         int used_cp = CP_UTF8;
                         if (wlen <= 0) {
@@ -2753,16 +2737,44 @@ static DWORD WINAPI IntegratedExecutionThread(LPVOID lpParam) {
                             }
                         }
                     }
-                    
-                    free(buffer);
+                    line_start = line_end + 1;
+                    if (delim == '\r' && *(line_end + 1) == '\n') {
+                        line_end++;
+                        line_start++;
+                    }
+                }
+                line_end++;
+            }
+            // Última línea sin salto
+            if (line_start < line_end) {
+                // mismo procesamiento que arriba
+                int wlen = MultiByteToWideChar(CP_UTF8, 0, line_start, -1, NULL, 0);
+                int used_cp = CP_UTF8;
+                if (wlen <= 0) {
+                    wlen = MultiByteToWideChar(CP_ACP, 0, line_start, -1, NULL, 0);
+                    used_cp = CP_ACP;
+                }
+                if (wlen > 0) {
+                    wchar_t *wline = (wchar_t*)malloc(wlen * sizeof(wchar_t));
+                    if (wline) {
+                        MultiByteToWideChar(used_cp, 0, line_start, -1, wline, wlen);
+                        wchar_t *filtered = TranslateConsoleLine(wline);
+                        free(wline);
+                        if (filtered) {
+                            size_t wlen_final = wcslen(filtered) + 3;
+                            wchar_t *wline_nl = (wchar_t*)malloc(wlen_final * sizeof(wchar_t));
+                            if (wline_nl) {
+                                wcscpy_s(wline_nl, wlen_final, filtered);
+                                wcscat_s(wline_nl, wlen_final, L"\r\n");
+                                SafePostAllocatedString(postTarget, WM_APPEND_OUTPUT, (WPARAM)p->hEdit, wline_nl);
+                            }
+                            free(filtered);
+                        }
+                    }
                 }
             }
-            fclose(read_out);
         }
-        
-        // Clean up temp files
-        DeleteFileA(temp_stdout_path);
-        DeleteFileA(temp_stderr_path);
+        if (redirect.buffer) free(redirect.buffer);
     }
     for (int i = 0; i < argc; ++i) {
         if (argv[i]) free(argv[i]);
@@ -2771,11 +2783,55 @@ static DWORD WINAPI IntegratedExecutionThread(LPVOID lpParam) {
     free(p);
 
     if (lock_acquired) {
+        // Avisar a la UI de que la operación terminó (para restaurar botones y texto Reiniciar)
+        if (opCancellable) PostMessageW(g_hwndMain ? g_hwndMain : GetForegroundWindow(), WM_OPERATION_DONE, 0, 0);
         InterlockedExchange(&g_operation_running, 0);
         PostMessageW(g_hwndMain ? g_hwndMain : GetForegroundWindow(), WM_ENABLE_BROWSE, (WPARAM)1, 0);
     }
 
     return result;
+}
+
+// Hilo para calcular el CRC32 del archivo de imagen seleccionado (pestaña Aplicar).
+// Se ejecuta en un hilo para no bloquear la UI y poder cancelarlo pulsando Reiniciar.
+typedef struct {
+    HWND hEdit;
+    wchar_t filepath[MAX_PATH];
+} CRC_THREAD_PARAM;
+
+static DWORD WINAPI CrcCalculationThread(LPVOID lpParam) {
+    CRC_THREAD_PARAM *p = (CRC_THREAD_PARAM*)lpParam;
+    HWND postTarget = g_hwndMain ? g_hwndMain : GetForegroundWindow();
+    if (!p) return 1;
+
+    // Impedir operaciones concurrentes (misma protección que Crear/Aplicar Parche)
+    if (InterlockedCompareExchange(&g_operation_running, 1, 0) != 0) {
+        free(p);
+        return 1;
+    }
+    InterlockedExchange(&g_cancel_requested, 0);
+    PostMessageW(postTarget, WM_OPERATION_START, 0, 0);
+
+    char file_ansi[MAX_PATH];
+    WideCharToMultiByte(CP_ACP, 0, p->filepath, -1, file_ansi, MAX_PATH, NULL, NULL);
+
+    uint32_t crc = crc32_file(file_ansi);
+    if (crc == 0xFFFFFFFFu) {
+        wchar_t *msg = _wcsdup(T(L"crc_cancelled"));
+        SafePostAllocatedString(postTarget, WM_APPEND_OUTPUT, (WPARAM)p->hEdit, msg);
+    } else if (crc == 0) {
+        wchar_t *msg = _wcsdup(L"No se pudo leer el archivo.\r\n");
+        SafePostAllocatedString(postTarget, WM_APPEND_OUTPUT, (WPARAM)p->hEdit, msg);
+    } else {
+        wchar_t result[256];
+        swprintf(result, 256, L"\r\nCRC32: %08X\r\n", crc);
+        SafePostAllocatedString(postTarget, WM_APPEND_OUTPUT, (WPARAM)p->hEdit, _wcsdup(result));
+    }
+
+    InterlockedExchange(&g_operation_running, 0);
+    PostMessageW(postTarget, WM_OPERATION_DONE, 0, 0);
+    free(p);
+    return 0;
 }
 
 // Use integrated execution instead of external process
@@ -2817,7 +2873,7 @@ static int GetMaxLabelTextWidth(HWND hwndRef, HFONT hF, HWND *labels, int count)
 // Compute button width using the same reference and constants as Apply panel
 static int ComputeButtonWidth(HWND hwndRef, HFONT hF, const wchar_t *text, HWND scaleRef) {
     int base = GetTextWidthInPixels(hwndRef, hF, text);
-    int margin = ScaleForWindow(scaleRef, 20); // uses same scale reference as Apply
+    int margin = ScaleForWindow(scaleRef, 12); // uses same scale reference as Apply
     return base + margin;
 }
 
@@ -2833,7 +2889,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     static HWND hCrearChkUndo, hCrearChkValid, hCrearLblTipo, hCrearComboTipo;
     static HWND hCrearBtnCrear, hCrearBtnShow, hCrearBtnAdd, hCrearBtnClear, hCrearBtnReset;
 
-    static HWND botones[14] = {0};
+    static HWND botones[15] = {0};
     static HWND hCrearOutput;
     static HWND hCrearLblSalida;
 
@@ -2842,7 +2898,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     static HWND hAplicarPanel = NULL;
     static HWND hAplicarLblImg, hAplicarEditImg, hAplicarBtnImg;
     static HWND hAplicarLblPPF, hAplicarEditPPF, hAplicarBtnPPF;
-    static HWND hAplicarChkRevert, hAplicarBtnApply, hAplicarBtnClear, hAplicarBtnReset;
+    static HWND hAplicarChkRevert, hAplicarChkSafe, hAplicarBtnApply, hAplicarBtnCRC32, hAplicarBtnClear, hAplicarBtnReset;
     static HWND hAplicarOutput;
     static HWND hAplicarLblSalida;
     static HWND themedCtrls[24] = {0};
@@ -2871,6 +2927,27 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (hCrearBtnDIZ) EnableWindow(hCrearBtnDIZ, enable);
         if (hAplicarBtnImg) EnableWindow(hAplicarBtnImg, enable);
         if (hAplicarBtnPPF) EnableWindow(hAplicarBtnPPF, enable);
+        return 0;
+    }
+    case WM_OPERATION_START: {
+        // Operación en curso: impedir pulsar los botones de acción y convertir Reiniciar en Cancelar
+        if (hCrearBtnCrear) EnableWindow(hCrearBtnCrear, FALSE);
+        if (hAplicarBtnApply) EnableWindow(hAplicarBtnApply, FALSE);
+        if (hAplicarBtnCRC32) EnableWindow(hAplicarBtnCRC32, FALSE);
+        if (hCrearBtnReset) SetWindowTextW(hCrearBtnReset, T(L"btn_cancel"));
+        if (hAplicarBtnReset) SetWindowTextW(hAplicarBtnReset, T(L"btn_cancel"));
+        ForceLayoutRefresh();
+        return 0;
+    }
+    case WM_OPERATION_DONE: {
+        // Operación terminada: restaurar botones de acción y el texto Reiniciar
+        if (hCrearBtnCrear) EnableWindow(hCrearBtnCrear, TRUE);
+        if (hAplicarBtnApply) EnableWindow(hAplicarBtnApply, TRUE);
+        if (hAplicarBtnCRC32) EnableWindow(hAplicarBtnCRC32, TRUE);
+        if (hCrearBtnReset) SetWindowTextW(hCrearBtnReset, T(L"btn_reset"));
+        if (hAplicarBtnReset) SetWindowTextW(hAplicarBtnReset, T(L"btn_reset_apply"));
+        InterlockedExchange(&g_cancel_requested, 0);
+        ForceLayoutRefresh();
         return 0;
     }
     case WM_CREAR_PROGRESS: {
@@ -2995,11 +3072,27 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                         }
                         if (ok) {
                             SetWindowTextAndScroll(hTarget, szPath);
-    // Si se arrastró un .ppf al campo PPF de la pestaña Aplicar, mostrar su información en la consola igual que al usar el botón de buscar (mismo flujo que el caso 212).
+    // Si se arrastró una imagen al campo Imagen Original (Crear), rellenar PPF si está vacío
+if (hTarget == hCrearEditImg) {
+    MaybeSetImageTypeFromPath(hCrearComboTipo, hCrearChkValid, szPath);
+    if (hCrearEditPPF) {
+        wchar_t curppf[MAX_PATH] = {0};
+        GetWindowTextW(hCrearEditPPF, curppf, MAX_PATH);
+        if (wcslen(curppf) == 0) {
+            wchar_t ppfpath[MAX_PATH];
+            wcscpy(ppfpath, szPath);
+            wchar_t *dot = wcsrchr(ppfpath, L'.');
+            if (dot) *dot = L'\0';
+            wcscat(ppfpath, L".ppf");
+            SetWindowTextAndScroll(hCrearEditPPF, ppfpath);
+        }
+    }
+}
                             if (hTarget == hAplicarEditPPF) {
                                 PROC_THREAD_PARAM *p = (PROC_THREAD_PARAM*)malloc(sizeof(PROC_THREAD_PARAM));
                                 if (p) {
                                     p->hEdit = hAplicarOutput;
+                                    p->cancellable = 0;
                                     p->cmdline[0] = 0;
                                     p->partial_len = 0; p->partial[0] = 0;
                                     wcscpy(p->cmdline, L"MakePPF");
@@ -3188,7 +3281,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         // reducir ligeramente la separación horizontal entre los checkboxes
         hCrearChkValid = CreateWindowW(L"BUTTON", T(L"chk_valid"), CHK_STYLE,
             xlbl + ScaleForWindow(hwnd,190), y, ScaleForWindow(hwnd,140), h, hCrearPanel, (HMENU)122, NULL, NULL);
-        UpdateCheckboxThemes(g_isDark, hCrearChkUndo, hCrearChkValid, hAplicarChkRevert);
+        UpdateCheckboxThemes(g_isDark, hCrearChkUndo, hCrearChkValid, hAplicarChkRevert, hAplicarChkSafe);
         // activar validación por defecto
         SendMessageW(hCrearChkValid, BM_SETCHECK, BST_CHECKED, 0);
         // etiqueta de tipo y combo; en la fila de checkboxes a la derecha (label bajado 3px para alineación visual)
@@ -3281,15 +3374,21 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
         hAplicarChkRevert = CreateWindowW(L"BUTTON", T(L"chk_revert"), CHK_STYLE,
             xlbl, ay, ScaleForWindow(hwnd,200), h, hAplicarPanel, (HMENU)221, NULL, NULL);
-        UpdateCheckboxThemes(g_isDark, hCrearChkUndo, hCrearChkValid, hAplicarChkRevert);
+        // Casilla "Parcheo seguro": desactivada por defecto. Al activarla se hace una copia temporal de la imagen.
+        hAplicarChkSafe = CreateWindowW(L"BUTTON", T(L"chk_safe_patch"), CHK_STYLE,
+            xlbl + ScaleForWindow(hwnd,208), ay, ScaleForWindow(hwnd,180), h, hAplicarPanel, (HMENU)222, NULL, NULL);
+        UpdateCheckboxThemes(g_isDark, hCrearChkUndo, hCrearChkValid, hAplicarChkRevert, hAplicarChkSafe);
         ay += h + sep + spcBeforeButtonsScaled; // pequeño espacio antes de los botones
+
+
         hAplicarBtnApply = CreateWindowW(L"BUTTON", T(L"btn_apply"), BTN_STYLE,
-            xlbl, ay, ScaleForWindow(hwnd,120), hBtn, hAplicarPanel, (HMENU)231, NULL, NULL);
+            xlbl, ay, ScaleForWindow(hwnd,100), hBtn, hAplicarPanel, (HMENU)231, NULL, NULL);
+        hAplicarBtnCRC32 = CreateWindowW(L"BUTTON", T(L"btn_crc"), BTN_STYLE,
+            xlbl + ScaleForWindow(hwnd,130), ay, ScaleForWindow(hwnd,120), hBtn, hAplicarPanel, (HMENU)234, NULL, NULL);
         hAplicarBtnClear = CreateWindowW(L"BUTTON", T(L"btn_clear_apply"), BTN_STYLE,
-            xlbl + ScaleForWindow(hwnd,130), ay, ScaleForWindow(hwnd,120), hBtn, hAplicarPanel, (HMENU)232, NULL, NULL);
+            xlbl + ScaleForWindow(hwnd,260), ay, ScaleForWindow(hwnd,120), hBtn, hAplicarPanel, (HMENU)232, NULL, NULL);
         hAplicarBtnReset = CreateWindowW(L"BUTTON", T(L"btn_reset_apply"), BTN_STYLE,
-            xlbl + ScaleForWindow(hwnd,260), ay, ScaleForWindow(hwnd,120), hBtn, hAplicarPanel, (HMENU)233, NULL, NULL);
-        
+            xlbl + ScaleForWindow(hwnd,390), ay, ScaleForWindow(hwnd,120), hBtn, hAplicarPanel, (HMENU)233, NULL, NULL);
         // Ajustar ancho de botones al texto
         wchar_t btnTxt2[128];
         int btnX2 = xlbl;
@@ -3297,17 +3396,21 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         GetWindowTextW(hAplicarBtnApply, btnTxt2, 128);
         int btnW2 = ComputeButtonWidth(hAplicarPanel, hFont, btnTxt2, hAplicarPanel);
         MoveWindow(hAplicarBtnApply, btnX2, ay, btnW2, hBtn, TRUE);
-        btnX2 += btnW2 + ScaleForWindow(hwnd,10);
-        
+            btnX2 += btnW2 + ScaleForWindow(hwnd,10);
+
+        GetWindowTextW(hAplicarBtnCRC32, btnTxt2, 128);
+            btnW2 = ComputeButtonWidth(hAplicarPanel, hFont, btnTxt2, hAplicarPanel);
+        MoveWindow(hAplicarBtnCRC32, btnX2, ay, btnW2, hBtn, TRUE);
+            btnX2 += btnW2 + ScaleForWindow(hwnd,10);
+
         GetWindowTextW(hAplicarBtnClear, btnTxt2, 128);
-        btnW2 = ComputeButtonWidth(hAplicarPanel, hFont, btnTxt2, hAplicarPanel);
+            btnW2 = ComputeButtonWidth(hAplicarPanel, hFont, btnTxt2, hAplicarPanel);
         MoveWindow(hAplicarBtnClear, btnX2, ay, btnW2, hBtn, TRUE);
-        btnX2 += btnW2 + ScaleForWindow(hwnd,10);
-        
+            btnX2 += btnW2 + ScaleForWindow(hwnd,10);
+
         GetWindowTextW(hAplicarBtnReset, btnTxt2, 128);
-        btnW2 = ComputeButtonWidth(hAplicarPanel, hFont, btnTxt2, hAplicarPanel);
+            btnW2 = ComputeButtonWidth(hAplicarPanel, hFont, btnTxt2, hAplicarPanel);
         MoveWindow(hAplicarBtnReset, btnX2, ay, btnW2, hBtn, TRUE);
-        ay += hBtn + sep + spcBeforeButtonsScaled;
 
         hAplicarLblSalida = CreateWindowW(L"STATIC", T(L"lbl_salida_apply"), WS_CHILD | WS_VISIBLE,
             xlbl, ay, ScaleForWindow(hwnd,60), h, hAplicarPanel, NULL, NULL, NULL);
@@ -3324,7 +3427,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
         // Asegurar fuente en todos los controles nuevos
         HWND aplicarControles[] = {hAplicarLblImg, hAplicarEditImg, hAplicarBtnImg, hAplicarLblPPF, hAplicarEditPPF, hAplicarBtnPPF,
-            hAplicarChkRevert, hAplicarBtnApply, hAplicarBtnClear, hAplicarBtnReset, hAplicarLblSalida, hAplicarOutput};
+        hAplicarChkRevert, hAplicarChkSafe, hAplicarBtnApply, hAplicarBtnCRC32, hAplicarBtnClear, hAplicarBtnReset, hAplicarLblSalida, hAplicarOutput};
         for (size_t i = 0; i < sizeof(aplicarControles)/sizeof(HWND); ++i) {
             SendMessageW(aplicarControles[i], WM_SETFONT, (WPARAM)hFont, TRUE);
             ApplyTheme(aplicarControles[i]);
@@ -3338,13 +3441,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         botones[0] = hCrearBtnImg; botones[1] = hCrearBtnMod; botones[2] = hCrearBtnPPF; botones[3] = hCrearBtnDIZ;
         botones[4] = hCrearBtnCrear; botones[5] = hCrearBtnShow; botones[6] = hCrearBtnAdd; botones[7] = hCrearBtnClear;
-        botones[8] = hAplicarBtnImg; botones[9] = hAplicarBtnPPF; botones[10] = hAplicarBtnApply; botones[11] = hAplicarBtnClear;
-        botones[12] = hCrearBtnReset; botones[13] = hAplicarBtnReset;
+        botones[8] = hAplicarBtnImg; botones[9] = hAplicarBtnPPF; botones[10] = hAplicarBtnApply; botones[11] = hAplicarBtnCRC32; botones[12] = hAplicarBtnClear;
+        botones[13] = hCrearBtnReset; botones[14] = hAplicarBtnReset;
         // controls to apply SetWindowTheme (scrollbars/dropdowns in dark mode)
         themedCtrls[0] = hCrearEditImg; themedCtrls[1] = hCrearEditMod; themedCtrls[2] = hCrearEditPPF; themedCtrls[3] = hCrearEditDIZ;
         themedCtrls[4] = hCrearEditDesc; themedCtrls[5] = hCrearComboTipo; themedCtrls[6] = hCrearOutput;
         themedCtrls[7] = hAplicarEditImg; themedCtrls[8] = hAplicarEditPPF; themedCtrls[9] = hAplicarOutput;
         themedCtrls[10] = hAplicarChkRevert; themedCtrls[11] = hCrearChkUndo; themedCtrls[12] = hCrearChkValid;
+        themedCtrls[13] = hAplicarChkSafe;
         // Use monospaced font for output windows to preserve column alignment
         if (hMonoFont) {
             SendMessageW(hCrearOutput, WM_SETFONT, (WPARAM)hMonoFont, TRUE);
@@ -3352,18 +3456,19 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         // Load saved settings (paths, checkboxes, combo) if present — now that all controls exist
         LoadSettings(hCrearEditImg, hCrearEditMod, hCrearEditPPF, hCrearEditDIZ, hCrearEditDesc, hCrearChkUndo, hCrearChkValid, hCrearComboTipo,
-                 hAplicarEditImg, hAplicarEditPPF, hAplicarChkRevert);
+                 hAplicarEditImg, hAplicarEditPPF, hAplicarChkRevert, hAplicarChkSafe);
         // Apply theme based on saved preference
-        ApplyCurrentTheme(g_themePref == 1, hwnd, hwndTab, hCrearPanel, hAplicarPanel, hCrearChkUndo, hCrearChkValid, hAplicarChkRevert, hMenuBar);
-        UpdateButtonThemes(g_isDark, botones, 14);
-        UpdateControlThemes(g_isDark, themedCtrls, 13);
+        ApplyCurrentTheme(g_themePref == 1, hwnd, hwndTab, hCrearPanel, hAplicarPanel, hCrearChkUndo, hCrearChkValid, hAplicarChkRevert, hAplicarChkSafe, hMenuBar);
+        UpdateButtonThemes(g_isDark, botones, 15);
+        UpdateControlThemes(g_isDark, themedCtrls, 14);
         // default tab sizing (owner-draw removed)
         // Traducción inicial de la UI
         TranslateUI(hwndTab, hCrearPanel, hAplicarPanel,
-            hCrearLblImg, hCrearLblMod, hCrearLblPPF, hCrearLblDIZ, hCrearLblDesc,
-            hCrearChkUndo, hCrearChkValid, hCrearLblTipo, hCrearComboTipo, hCrearBtnCrear, hCrearBtnShow, hCrearBtnAdd, hCrearBtnClear, hCrearBtnReset, NULL,
-            hAplicarLblImg, hAplicarLblPPF, hAplicarChkRevert, hAplicarBtnApply, hAplicarBtnClear, hAplicarBtnReset, hAplicarLblSalida,
-            hMenuBar, hMenuIdioma, hMenuTema, hMenuAyuda);
+        hCrearLblImg, hCrearLblMod, hCrearLblPPF, hCrearLblDIZ, hCrearLblDesc,
+        hCrearChkUndo, hCrearChkValid, hCrearLblTipo, hCrearComboTipo, hCrearBtnCrear, hCrearBtnShow, hCrearBtnAdd, hCrearBtnClear, hCrearBtnReset, NULL,
+        hAplicarLblImg, hAplicarLblPPF, hAplicarChkRevert, hAplicarChkSafe, hAplicarBtnApply, hAplicarBtnClear, hAplicarBtnReset, hAplicarLblSalida,
+        hMenuBar, hMenuIdioma, hMenuTema, hMenuAyuda);
+        SetWindowTextW(hAplicarBtnCRC32, T(L"btn_crc"));
         // Ensure menu checks reflect loaded language/theme
         UpdateLanguageMenuChecks(hMenuBar);
         UpdateThemeMenuChecks(hMenuBar, g_isDark);
@@ -3487,7 +3592,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     if (progX + progW > panelW - marginRight) progW = panelW - marginRight - progX;
                     if (progW < ScaleForWindow(hCrearPanel, 40)) progW = ScaleForWindow(hCrearPanel, 40); // ancho mínimo
                     // Espacio superior de la barra de progreso y línea superior
-                    int progY = y_local + h_local + ScaleForWindow(hCrearPanel, 6);
+                    int progY = y_local + h_local + ScaleForWindow(hCrearPanel, 5);
                     if (!g_hCrearTopProgress) {
                         g_hCrearTopProgress = CreateWindowExW(0, L"msctls_progress32", NULL, WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS,
                             progX, progY, progW, progH, hCrearPanel, (HMENU)151, NULL, NULL);
@@ -3539,22 +3644,22 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 GetWindowTextW(hCrearBtnCrear, btnTxt, 128);
                 int btnW = ComputeButtonWidth(hwndRefForMeasure, hFont, btnTxt, hAplicarPanel ? hAplicarPanel : hCrearPanel);
                 MoveWindow(hCrearBtnCrear, btnX, y_local, btnW, h_action, TRUE);
-                btnX += btnW + ScaleForWindow(hwnd,10);
+                btnX += btnW + ScaleForWindow(hwnd,6);
 
                 GetWindowTextW(hCrearBtnShow, btnTxt, 128);
                 btnW = ComputeButtonWidth(hwndRefForMeasure, hFont, btnTxt, hAplicarPanel ? hAplicarPanel : hCrearPanel);
                 MoveWindow(hCrearBtnShow, btnX, y_local, btnW, h_action, TRUE);
-                btnX += btnW + ScaleForWindow(hwnd,10);
+                btnX += btnW + ScaleForWindow(hwnd,6);
 
                 GetWindowTextW(hCrearBtnAdd, btnTxt, 128);
                 btnW = ComputeButtonWidth(hwndRefForMeasure, hFont, btnTxt, hAplicarPanel ? hAplicarPanel : hCrearPanel);
                 MoveWindow(hCrearBtnAdd, btnX, y_local, btnW, h_action, TRUE);
-                btnX += btnW + ScaleForWindow(hwnd,10);
+                btnX += btnW + ScaleForWindow(hwnd,6);
 
                 GetWindowTextW(hCrearBtnClear, btnTxt, 128);
                 btnW = ComputeButtonWidth(hwndRefForMeasure, hFont, btnTxt, hAplicarPanel ? hAplicarPanel : hCrearPanel);
                 MoveWindow(hCrearBtnClear, btnX, y_local, btnW, h_action, TRUE);
-                btnX += btnW + ScaleForWindow(hwnd,10);
+                btnX += btnW + ScaleForWindow(hwnd,6);
 
                 // Reiniciar alineado a la derecha con el final de la barra de progreso
                 GetWindowTextW(hCrearBtnReset, btnTxt, 128);
@@ -3608,6 +3713,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     int revert_w = GetTextWidthInPixels(hAplicarPanel, hFont, chkTxtA) + ScaleForWindow(hAplicarPanel, 24);
                     if (revert_w < ScaleForWindow(hAplicarPanel, 120)) revert_w = ScaleForWindow(hAplicarPanel, 120);
                     MoveWindow(hAplicarChkRevert, axlbl, ay_local, revert_w, h_local, TRUE);
+                    // Casilla "Parcheo seguro" a continuación de "Deshacer parche" con pequeña separación
+                    if (hAplicarChkSafe) {
+                        wchar_t chkTxtSafe[128] = {0};
+                        GetWindowTextW(hAplicarChkSafe, chkTxtSafe, 128);
+                        int safe_w = GetTextWidthInPixels(hAplicarPanel, hFont, chkTxtSafe) + ScaleForWindow(hAplicarPanel, 24);
+                        if (safe_w < ScaleForWindow(hAplicarPanel, 130)) safe_w = ScaleForWindow(hAplicarPanel, 130);
+                        int safe_x = axlbl + revert_w + ScaleForWindow(hAplicarPanel, 12);
+                        MoveWindow(hAplicarChkSafe, safe_x, ay_local, safe_w, h_local, TRUE);
+                    }
                     ay_local += h_local + gap + ScaleForWindow(hAplicarPanel, spcBeforeButtons);
 
                     // Create or move Apply-tab progress control placed immediately under the checkbox
@@ -3618,8 +3732,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                         // Limitar ancho para que quepa dentro del panel
                         if (progX + progW > apanelW - marginRight) progW = apanelW - marginRight - progX;
                         if (progW < ScaleForWindow(hAplicarPanel, 40)) progW = ScaleForWindow(hAplicarPanel, 40); // ancho mínimo
-                        // Espacio superior de la barra de progreso y línea superior
-                        int progY = ay_local - ScaleForWindow(hAplicarPanel, 4);
+                        // Espacio superior de la barra de progreso y línea superior, pestaña aplicar parche
+                        int progY = ay_local - ScaleForWindow(hAplicarPanel, 2);
                         if (!g_hAplicarTopProgress) {
                             g_hAplicarTopProgress = CreateWindowExW(0, L"msctls_progress32", NULL, WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS,
                                 progX, progY, progW, progH, hAplicarPanel, (HMENU)152, NULL, NULL);
@@ -3649,13 +3763,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     // Añadir espaciado igual a la altura de progreso + pequeño hueco para separar de botones
                     {
                         int prog_h_local = ScaleForWindow(hAplicarPanel, 14);
-                        int gap_after = ScaleForWindow(hAplicarPanel, 10);
+                        int gap_after = ScaleForWindow(hAplicarPanel, 5);
                         // Avanzar pasado progreso + hueco
                         ay_local += prog_h_local + gap_after;
                     }
 
                     // Ajustar ancho de botones al texto
-                    int btnMargin2 = ScaleForWindow(hAplicarPanel, 20);
+                    int btnMargin2 = ScaleForWindow(hAplicarPanel, 12);
                     int btnX2 = axlbl;
                     wchar_t btnTxt2[128];
 
@@ -3667,22 +3781,26 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                         progRight2 = rcP2.right;
                     }
 
-                    GetWindowTextW(hAplicarBtnApply, btnTxt2, 128);
-                    int btnW2 = GetTextWidthInPixels(hAplicarPanel, hFont, btnTxt2) + btnMargin2;
-                    MoveWindow(hAplicarBtnApply, btnX2, ay_local, btnW2, h_action, TRUE);
-                    btnX2 += btnW2 + ScaleForWindow(hAplicarPanel, 10);
+GetWindowTextW(hAplicarBtnApply, btnTxt2, 128);
+int btnW2 = GetTextWidthInPixels(hAplicarPanel, hFont, btnTxt2) + btnMargin2;
+MoveWindow(hAplicarBtnApply, btnX2, ay_local, btnW2, h_action, TRUE);
+btnX2 += btnW2 + ScaleForWindow(hAplicarPanel, 6);
 
-                    GetWindowTextW(hAplicarBtnClear, btnTxt2, 128);
-                    btnW2 = GetTextWidthInPixels(hAplicarPanel, hFont, btnTxt2) + btnMargin2;
-                    MoveWindow(hAplicarBtnClear, btnX2, ay_local, btnW2, h_action, TRUE);
-                    btnX2 += btnW2 + ScaleForWindow(hAplicarPanel, 10);
+GetWindowTextW(hAplicarBtnCRC32, btnTxt2, 128);
+btnW2 = GetTextWidthInPixels(hAplicarPanel, hFont, btnTxt2) + btnMargin2;
+MoveWindow(hAplicarBtnCRC32, btnX2, ay_local, btnW2, h_action, TRUE);
+btnX2 += btnW2 + ScaleForWindow(hAplicarPanel, 6);
 
-                    // Reiniciar alineado a la derecha con el final de la barra de progreso
-                    GetWindowTextW(hAplicarBtnReset, btnTxt2, 128);
-                    btnW2 = GetTextWidthInPixels(hAplicarPanel, hFont, btnTxt2) + btnMargin2;
-                    int resetX2 = progRight2 - btnW2;
-                    if (resetX2 < btnX2) resetX2 = btnX2; // si falta espacio, no solapar
-                    MoveWindow(hAplicarBtnReset, resetX2, ay_local, btnW2, h_action, TRUE);
+GetWindowTextW(hAplicarBtnClear, btnTxt2, 128);
+btnW2 = GetTextWidthInPixels(hAplicarPanel, hFont, btnTxt2) + btnMargin2;
+MoveWindow(hAplicarBtnClear, btnX2, ay_local, btnW2, h_action, TRUE);
+btnX2 += btnW2 + ScaleForWindow(hAplicarPanel, 6);
+
+GetWindowTextW(hAplicarBtnReset, btnTxt2, 128);
+btnW2 = GetTextWidthInPixels(hAplicarPanel, hFont, btnTxt2) + btnMargin2;
+int resetX2 = progRight2 - btnW2;
+if (resetX2 < btnX2) resetX2 = btnX2;
+MoveWindow(hAplicarBtnReset, resetX2, ay_local, btnW2, h_action, TRUE);
                     ay_local += h_action + gap;
                 }
                 if (hAplicarLblSalida) {
@@ -3705,13 +3823,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         int id = LOWORD(wParam);
         switch (id) {
         case 301: // Español
-            g_lang = LANG_ES;
-            TranslateUI(hwndTab, hCrearPanel, hAplicarPanel,
-                hCrearLblImg, hCrearLblMod, hCrearLblPPF, hCrearLblDIZ, hCrearLblDesc,
-                hCrearChkUndo, hCrearChkValid, hCrearLblTipo, hCrearComboTipo, hCrearBtnCrear, hCrearBtnShow, hCrearBtnAdd, hCrearBtnClear, hCrearBtnReset, NULL,
-                hAplicarLblImg, hAplicarLblPPF, hAplicarChkRevert, hAplicarBtnApply, hAplicarBtnClear, hAplicarBtnReset, hAplicarLblSalida,
-                GetMenu(hwnd), GetSubMenu(GetMenu(hwnd), 0), GetSubMenu(GetMenu(hwnd), 1), GetSubMenu(GetMenu(hwnd), 2));
-            ForceLayoutRefresh();
+    g_lang = LANG_ES;
+    TranslateUI(hwndTab, hCrearPanel, hAplicarPanel,
+        hCrearLblImg, hCrearLblMod, hCrearLblPPF, hCrearLblDIZ, hCrearLblDesc,
+        hCrearChkUndo, hCrearChkValid, hCrearLblTipo, hCrearComboTipo, hCrearBtnCrear, hCrearBtnShow, hCrearBtnAdd, hCrearBtnClear, hCrearBtnReset, NULL,
+        hAplicarLblImg, hAplicarLblPPF, hAplicarChkRevert, hAplicarChkSafe, hAplicarBtnApply, hAplicarBtnClear, hAplicarBtnReset, hAplicarLblSalida,
+        GetMenu(hwnd), GetSubMenu(GetMenu(hwnd), 0), GetSubMenu(GetMenu(hwnd), 1), GetSubMenu(GetMenu(hwnd), 2));
+    SetWindowTextW(hAplicarBtnCRC32, T(L"btn_crc"));
+    ForceLayoutRefresh();
             if (g_hwndMain) {
                 HMENU hMenuBar = GetMenu(g_hwndMain);
                 if (hMenuBar) {
@@ -3740,13 +3859,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             }
             break;
         case 302: // English
-            g_lang = LANG_EN;
-            TranslateUI(hwndTab, hCrearPanel, hAplicarPanel,
-                hCrearLblImg, hCrearLblMod, hCrearLblPPF, hCrearLblDIZ, hCrearLblDesc,
-                hCrearChkUndo, hCrearChkValid, hCrearLblTipo, hCrearComboTipo, hCrearBtnCrear, hCrearBtnShow, hCrearBtnAdd, hCrearBtnClear, hCrearBtnReset, NULL,
-                hAplicarLblImg, hAplicarLblPPF, hAplicarChkRevert, hAplicarBtnApply, hAplicarBtnClear, hAplicarBtnReset, hAplicarLblSalida,
-                GetMenu(hwnd), GetSubMenu(GetMenu(hwnd), 0), GetSubMenu(GetMenu(hwnd), 1), GetSubMenu(GetMenu(hwnd), 2));
-            ForceLayoutRefresh();
+    g_lang = LANG_EN;
+    TranslateUI(hwndTab, hCrearPanel, hAplicarPanel,
+        hCrearLblImg, hCrearLblMod, hCrearLblPPF, hCrearLblDIZ, hCrearLblDesc,
+        hCrearChkUndo, hCrearChkValid, hCrearLblTipo, hCrearComboTipo, hCrearBtnCrear, hCrearBtnShow, hCrearBtnAdd, hCrearBtnClear, hCrearBtnReset, NULL,
+        hAplicarLblImg, hAplicarLblPPF, hAplicarChkRevert, hAplicarChkSafe, hAplicarBtnApply, hAplicarBtnClear, hAplicarBtnReset, hAplicarLblSalida,
+        GetMenu(hwnd), GetSubMenu(GetMenu(hwnd), 0), GetSubMenu(GetMenu(hwnd), 1), GetSubMenu(GetMenu(hwnd), 2));
+    SetWindowTextW(hAplicarBtnCRC32, T(L"btn_crc"));
+    ForceLayoutRefresh();
             // Refrescar menú de idioma
             if (g_hwndMain) {
                 HMENU hMenuBar = GetMenu(g_hwndMain);
@@ -3776,23 +3896,42 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 nmhdr.code = TCN_SELCHANGE;
                 SendMessageW(hwnd, WM_NOTIFY, (WPARAM)nmhdr.idFrom, (LPARAM)&nmhdr);
             }
-            break;
+    break;
         case 203: { // Tema oscuro
             g_themePref = 1;
-            ApplyCurrentTheme(true, hwnd, hwndTab, hCrearPanel, hAplicarPanel, hCrearChkUndo, hCrearChkValid, hAplicarChkRevert, GetMenu(hwnd));
-            UpdateButtonThemes(g_isDark, botones, 14);
-            UpdateControlThemes(g_isDark, themedCtrls, 13);
-            if (hCrearComboTipo) InvalidateRect(hCrearComboTipo, NULL, TRUE);
-            break;
-        }
+        ApplyCurrentTheme(true, hwnd, hwndTab, hCrearPanel, hAplicarPanel,
+            hCrearChkUndo, hCrearChkValid, hAplicarChkRevert, hAplicarChkSafe,
+            GetMenu(hwnd));
+
+        UpdateButtonThemes(g_isDark, botones, 15);
+        UpdateControlThemes(g_isDark, themedCtrls, 14);
+
+        // Recalcular la geometría de los paneles con el nuevo estilo del TabControl
+        ForceLayoutRefresh();
+
+            if (hCrearComboTipo)
+            InvalidateRect(hCrearComboTipo, NULL, TRUE);
+
+    break;
+}
+
         case 204: { // Tema claro
             g_themePref = 0;
-            ApplyCurrentTheme(false, hwnd, hwndTab, hCrearPanel, hAplicarPanel, hCrearChkUndo, hCrearChkValid, hAplicarChkRevert, GetMenu(hwnd));
-            UpdateButtonThemes(g_isDark, botones, 14);
-            UpdateControlThemes(g_isDark, themedCtrls, 13);
-            if (hCrearComboTipo) InvalidateRect(hCrearComboTipo, NULL, TRUE);
-            break;
-        }
+        ApplyCurrentTheme(false, hwnd, hwndTab, hCrearPanel, hAplicarPanel,
+            hCrearChkUndo, hCrearChkValid, hAplicarChkRevert, hAplicarChkSafe,
+            GetMenu(hwnd));
+
+        UpdateButtonThemes(g_isDark, botones, 15);
+        UpdateControlThemes(g_isDark, themedCtrls, 14);
+
+        // Recalcular la geometría de los paneles con el nuevo estilo del TabControl
+        ForceLayoutRefresh();
+
+        if (hCrearComboTipo)
+        InvalidateRect(hCrearComboTipo, NULL, TRUE);
+
+    break;
+}
         case 206: // About
             ShowAboutDialog(hwnd);
             break;
@@ -3936,6 +4075,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             PROC_THREAD_PARAM *p = (PROC_THREAD_PARAM*)malloc(sizeof(PROC_THREAD_PARAM));
             if (!p) break;
             p->hEdit = hCrearOutput;
+            p->cancellable = 1;
             p->partial_len = 0; p->partial[0] = 0;
             // build command line from controls
             BuildCreateCmdLine(p->cmdline, sizeof(p->cmdline)/sizeof(wchar_t), hCrearEditImg, hCrearEditMod, hCrearEditPPF, hCrearEditDIZ, hCrearEditDesc, hCrearChkUndo, hCrearChkValid, hCrearComboTipo);
@@ -3966,7 +4106,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
             // save current settings
             SaveSettings(hCrearEditImg, hCrearEditMod, hCrearEditPPF, hCrearEditDIZ, hCrearEditDesc, hCrearChkUndo, hCrearChkValid, hCrearComboTipo,
-                         hAplicarEditImg, hAplicarEditPPF, hAplicarChkRevert);
+                         hAplicarEditImg, hAplicarEditPPF, hAplicarChkRevert, hAplicarChkSafe);
             HANDLE hThread = CreateThread(NULL, 0, ProcessCaptureThread, p, 0, NULL);
             if (hThread) CloseHandle(hThread); // CRÍTICO: cerrar handle del hilo para prevenir fugas
             break;
@@ -3976,6 +4116,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             PROC_THREAD_PARAM *p = (PROC_THREAD_PARAM*)malloc(sizeof(PROC_THREAD_PARAM));
             if (!p) break;
             p->hEdit = hCrearOutput;
+            p->cancellable = 0;
             p->partial_len = 0; p->partial[0] = 0;
             p->cmdline[0] = 0;
             wcscpy(p->cmdline, L"MakePPF");
@@ -3996,6 +4137,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             PROC_THREAD_PARAM *p = (PROC_THREAD_PARAM*)malloc(sizeof(PROC_THREAD_PARAM));
             if (!p) break;
             p->hEdit = hCrearOutput;
+            p->cancellable = 0;
             p->partial_len = 0; p->partial[0] = 0;
             p->cmdline[0] = 0;
             wcscpy(p->cmdline, L"MakePPF");
@@ -4090,6 +4232,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     PROC_THREAD_PARAM *p = (PROC_THREAD_PARAM*)malloc(sizeof(PROC_THREAD_PARAM));
                     if (p) {
                         p->hEdit = hAplicarOutput;
+                        p->cancellable = 0;
                         p->cmdline[0] = 0;
                         p->partial_len = 0; p->partial[0] = 0;
                         wcscpy(p->cmdline, L"MakePPF");
@@ -4106,47 +4249,67 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             }
             break;
         }
-        case 231: // Aplicar Parche
-        {
-            PROC_THREAD_PARAM *p = (PROC_THREAD_PARAM*)malloc(sizeof(PROC_THREAD_PARAM));
-            if (!p) break;
-            p->hEdit = hAplicarOutput;
-            p->partial_len = 0; p->partial[0] = 0;
-            BuildApplyCmdLine(p->cmdline, sizeof(p->cmdline)/sizeof(wchar_t), hAplicarEditImg, hAplicarEditPPF, hAplicarChkRevert);
+case 231: // Aplicar Parche
+{
+    PROC_THREAD_PARAM *p = (PROC_THREAD_PARAM*)malloc(sizeof(PROC_THREAD_PARAM));
+    if (!p) break;
+    p->hEdit = hAplicarOutput;
+    p->cancellable = 1;
+    p->partial_len = 0; p->partial[0] = 0;
+    BuildApplyCmdLine(p->cmdline, sizeof(p->cmdline)/sizeof(wchar_t), hAplicarEditImg, hAplicarEditPPF, hAplicarChkRevert, hAplicarChkSafe);
 
-            // GUI-side validation: ensure bin and ppf are selected
-            {
-                wchar_t img[MAX_PATH] = {0}, ppf[MAX_PATH] = {0};
-                if (hAplicarEditImg) GetWindowTextW(hAplicarEditImg, img, MAX_PATH);
-                if (hAplicarEditPPF) GetWindowTextW(hAplicarEditPPF, ppf, MAX_PATH);
-                if (wcslen(img) == 0 || wcslen(ppf) == 0) {
-                    if (wcslen(img) == 0) AppendTextToEdit(hAplicarOutput, tw("select_apply_bin"));
-                    if (wcslen(ppf) == 0) AppendTextToEdit(hAplicarOutput, tw("select_apply_ppf"));
-                    free(p);
-                    break;
-                }
-            }
+    // Validación y ejecución...
+    wchar_t img[MAX_PATH] = {0}, ppf[MAX_PATH] = {0};
+    if (hAplicarEditImg) GetWindowTextW(hAplicarEditImg, img, MAX_PATH);
+    if (hAplicarEditPPF) GetWindowTextW(hAplicarEditPPF, ppf, MAX_PATH);
+    if (wcslen(img) == 0 || wcslen(ppf) == 0) {
+        if (wcslen(img) == 0) AppendTextToEdit(hAplicarOutput, tw("select_apply_bin"));
+        if (wcslen(ppf) == 0) AppendTextToEdit(hAplicarOutput, tw("select_apply_ppf"));
+        free(p);
+        break;
+    }
 
-            // save current settings
-            SaveSettings(hCrearEditImg, hCrearEditMod, hCrearEditPPF, hCrearEditDIZ, hCrearEditDesc, hCrearChkUndo, hCrearChkValid, hCrearComboTipo,
-                         hAplicarEditImg, hAplicarEditPPF, hAplicarChkRevert);
-            HANDLE hThread = CreateThread(NULL, 0, ProcessCaptureThread, p, 0, NULL);
-            if (hThread) CloseHandle(hThread); // CRÍTICO: cerrar handle del hilo para prevenir fugas
-            break;
-        }
-        case 232: // Limpiar salida aplicar
-            SetWindowTextW(hAplicarOutput, L"");
-            // Resetear progreso de la pestaña Crear a cero, mantener visible y no interactiva
-            CrearProgress_ResetToZero();
-            // Resetear progreso de la pestaña Aplicar a cero, mantener visible y no interactiva
-            AplicarProgress_ResetToZero();
-            break;
+    SaveSettings(hCrearEditImg, hCrearEditMod, hCrearEditPPF, hCrearEditDIZ, hCrearEditDesc, hCrearChkUndo, hCrearChkValid, hCrearComboTipo,
+                 hAplicarEditImg, hAplicarEditPPF, hAplicarChkRevert, hAplicarChkSafe);
+    HANDLE hThread = CreateThread(NULL, 0, ProcessCaptureThread, p, 0, NULL);
+    if (hThread) CloseHandle(hThread);
+    break;
+}
+case 234: // Calcular CRC32
+{
+    wchar_t wfile[MAX_PATH] = {0};
+    GetWindowTextW(hAplicarEditImg, wfile, MAX_PATH);
+
+    if (wfile[0] == L'\0') {
+        AppendTextToEdit(hAplicarOutput, L"Selecciona un archivo de imagen primero.\r\n");
+        break;
+    }
+
+    // Calcular el CRC en un hilo para no bloquear la UI y poder cancelarlo con Reiniciar
+    CRC_THREAD_PARAM *p = (CRC_THREAD_PARAM*)malloc(sizeof(CRC_THREAD_PARAM));
+    if (!p) break;
+    p->hEdit = hAplicarOutput;
+    wcscpy_s(p->filepath, MAX_PATH, wfile);
+    HANDLE hThread = CreateThread(NULL, 0, CrcCalculationThread, p, 0, NULL);
+    if (hThread) CloseHandle(hThread); // CRÍTICO: cerrar handle del hilo para prevenir fugas
+    break;
+}
+case 232: // Limpiar salida aplicar
+    SetWindowTextW(hAplicarOutput, L"");
+    CrearProgress_ResetToZero();
+    AplicarProgress_ResetToZero();
+    break;
         case 135: // Reiniciar (pestaña Crear) — restablece la interfaz como al abrir la aplicación
         case 233: // Reiniciar (pestaña Aplicar)
+            // Durante una operación el botón muestra "Cancelar/Cancel": al pulsarlo se cancela la operación
+            if (InterlockedCompareExchange(&g_operation_running, 0, 0)) {
+                InterlockedExchange(&g_cancel_requested, 1);
+                break;
+            }
             ResetAppToFreshState(hCrearOutput, hAplicarOutput,
                 hCrearEditImg, hCrearEditMod, hCrearEditPPF, hCrearEditDIZ, hCrearEditDesc,
                 hAplicarEditImg, hAplicarEditPPF,
-                hCrearChkUndo, hCrearChkValid, hAplicarChkRevert,
+                hCrearChkUndo, hCrearChkValid, hAplicarChkRevert, hAplicarChkSafe,
                 hCrearComboTipo);
             break;
         }
@@ -4250,7 +4413,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (g_hIconSmall) { DestroyIcon(g_hIconSmall); g_hIconSmall = NULL; }
         // persist settings on exit
         SaveSettings(hCrearEditImg, hCrearEditMod, hCrearEditPPF, hCrearEditDIZ, hCrearEditDesc, hCrearChkUndo, hCrearChkValid, hCrearComboTipo,
-                     hAplicarEditImg, hAplicarEditPPF, hAplicarChkRevert);
+                     hAplicarEditImg, hAplicarEditPPF, hAplicarChkRevert, hAplicarChkSafe);
         // Delete created fonts
         if (hFont) { DeleteObject(hFont); hFont = NULL; }
         if (hMonoFont) { DeleteObject(hMonoFont); hMonoFont = NULL; }
@@ -5163,7 +5326,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
     wc.hIconSm = LoadIconWithScaleDownIfAvailable(hInstance, MAKEINTRESOURCEW(101), cxSm, cySm);
     RegisterClassExW(&wc);
 
-    int base_w = 545, base_h = 645; // Tamaño ventana a 96 DPI
+    int base_w = 545, base_h = 610; // Tamaño ventana a 96 DPI
 
     // Crear ventana con tamaño lógico base, luego redimensionarla al DPI de la ventana tras la creación
     // (esto asegura que el tamaño se calcule usando el DPI del monitor donde se crea la ventana)

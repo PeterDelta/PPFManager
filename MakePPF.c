@@ -28,6 +28,9 @@
 /* Flag shared with GUI executable indicating user requested shutdown.  */
 extern volatile LONG g_app_closing;
 
+/* Flag shared with GUI executable indicating user requested cancellation of the current operation.  */
+extern volatile LONG g_cancel_requested;
+
 #ifndef BUILD_STANDALONE
 /* Use shared PrintWin32ErrorFmt from PPFManager (no local implementation needed) */
 #endif 
@@ -215,7 +218,7 @@ void PPFCreatePatch(void){
 
 	if(PPFCreateHeader()){ printf("Error: headercreation failed\n"); if (MakePPF_ProgressCallback) MakePPF_ProgressCallback(100.0); return; }
 
-	if (PPFGetChanges()) { printf("Error: failed while collecting changes\n"); if (MakePPF_ProgressCallback) MakePPF_ProgressCallback(100.0); CloseAllFiles(); return; }
+	if (PPFGetChanges()) { printf("Error: failed while collecting changes or it was canceled\n"); if (MakePPF_ProgressCallback) MakePPF_ProgressCallback(100.0); CloseAllFiles(); return; }
 	if(Arg.fileid) { if (PPFAddFileId()) { printf("Error: failed to add %s\n", PPFManager_FileIdNameA()); CloseAllFiles(); return; } }
 
 	/* Finish progress */
@@ -341,8 +344,8 @@ int PPFGetChanges(void){
 	printf("Finding differences... \n");
 	printf("Progress: "); fflush(stdout);
 	do{
-		/* if the user closed the GUI, abort as soon as convenient */
-		if (InterlockedCompareExchange(&g_app_closing,0,0)) {
+		/* if the user closed the GUI or pressed Cancelar, abort as soon as convenient */
+		if (InterlockedCompareExchange(&g_app_closing,0,0) || InterlockedCompareExchange(&g_cancel_requested,0,0)) {
 			free(x); free(y);
 			return 1; /* treat as failure and unwind */
 		}

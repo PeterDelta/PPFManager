@@ -5,7 +5,7 @@
 #include <stdio.h>
 
 /* versión central */
-#define PPF_VERSION_STR "1.03"
+#define PPF_VERSION_STR "1.04"
 
 /* Las macros auxiliares permanecen en caso de que otro código desee realizar la conversión */
 #define PPF_STR_HELPER(x) #x
@@ -31,9 +31,12 @@ enum { LANG_ES = 0, LANG_EN = 1 };
 static int g_lang = LANG_EN;
 /* La versión independiente necesita su propia bandera de cierre; la GUI la establece en la compilación combinada */
 volatile LONG g_app_closing = 0;
+/* Bandera de cancelación para compilaciones independientes (la GUI la define en la compilación combinada) */
+volatile LONG g_cancel_requested = 0;
 #else
 extern int g_lang;
 extern volatile LONG g_app_closing;
+extern volatile LONG g_cancel_requested;
 #endif
 
 /* prototipos de ayudantes. al compilar de forma independiente se declaran static inline para coincidir
