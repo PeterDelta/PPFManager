@@ -14,6 +14,7 @@ Cambios relevantes:
 - Archivo .diz se limita a 3 KB para no romper el parche.
 - Gestión y limpieza de errores mejorada y más robusta.
 - Corregidos errores menores que podían causar conflictos.
+- Añadido soporte para .7z que contengan un .ppf (requiere tener instalado 7-zip)
 
 ____________________________________
 
@@ -30,3 +31,4 @@ Key changes:
 - .diz file is limited to 3 KB to avoid breaking the patch.
 - Improved and more robust error handling and cleanup.
 - Minor errors that could cause conflicts have been corrected.
+- Added support for .7z files containing a .ppf (requires 7-Zip to be installed)
