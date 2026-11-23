@@ -393,7 +393,7 @@ static const UI_TEXT_ENTRY UI_TEXTS[] = {
      L"(soporta .7z que lo contenga).\n  - Botón Añadir .diz — Inserta el archivo.diz al parche.\n  - Botón Limpiar — Limpia el texto de la salida de la consola.\n  - Botón Reiniciar — Reinicia la "
      L"aplicación al estado inicial.\n\nPestaña Aplicar Parche:\n  - Imagen original — Seleccionar la imagen original\n  - Archivo PPF — Seleccionar el parche para aplicar en la imagen (soporta "
      L"archivo .7z que lo contenga)\n  - Deshacer parche — Devuelve a la imagen original. (El .ppf tiene que haber sido creado con estos datos)\n  - Parcheo seguro — Asegura que no se corrompa la "
-     L"imagen realizando una copia temporal (proceso más lento).\n  - Botón Ver CRC — Muestra el cálculo CRC del archivo seleccionado.\n",
+     L"imagen realizando una copia temporal (proceso más lento).\n  - Botón Ver CRC — Muestra el cálculo CRC32 del archivo seleccionado.\n",
      L"Files can be dragged to the address path or searched for manually.\n\nCreate Patch tab:\n  - Original image — Select the unmodified image.\n  - Modified image — Select the modified image.\n  "
      L"- PPF file — Choose the patch name, it is added automatically when selecting the Original image.\n  - File.diz (optional) — File that contains informative text about the patch and is inserted "
      L"inside the .ppf\n  - Description (optional) — Adds a description and is inserted inside the .ppf\n    Options:\n  - Include undo data — Insert data to be able to return the original image (it "
@@ -402,7 +402,7 @@ static const UI_TEXT_ENTRY UI_TEXTS[] = {
      L"it).\n  - Add file.diz button — Adds a file.diz file to the patch.\n  - Clear button — Clears the text of the console output.\n  - Reset button — Resets the application to its initial "
      L"state.\n\nApply Patch tab:\n  - Original image — Select the original image\n  - PPF file — Select the patch to apply to the image (supports 7z files)\n  - Undo patch — Returns to the original "
      L"image. (The .ppf must have been created with these data)\n  - Safe patching — Ensure that the image is not corrupted by making a temporary copy (slower process).\n  - View CRC button — "
-     L"Displays the CRC calculation of the selected file.\n"},
+     L"Displays the CRC32 calculation of the selected file.\n"},
     {L"btn_crc", L"Ver CRC", L"View CRC"},
     {L"crc_cancelled", L"CRC32: operación cancelada.\r\n", L"CRC32: operation cancelled.\r\n"},
     {L"select_image_first", L"Selecciona un archivo de imagen primero.\r\n", L"Select an image file first.\r\n"},
@@ -2104,7 +2104,7 @@ static void GetSettingsFilePath(wchar_t *out, size_t outSize) {
 }
 
 static void LoadSettings(HWND hCrearEditImg, HWND hCrearEditMod, HWND hCrearEditPPF, HWND hCrearEditDIZ, HWND hCrearEditDesc, HWND hCrearChkUndo, HWND hCrearChkValid, HWND hCrearComboTipo,
-                         HWND hAplicarEditImg, HWND hAplicarEditPPF, HWND hAplicarChkRevert, HWND hAplicarChkSafe) {
+                         HWND hAplicarEditImg, HWND hAplicarEditPPF, HWND hAplicarChkRevert, HWND hAplicarChkSafe, HWND hwndTab, HWND hCrearPanel, HWND hAplicarPanel) {
   wchar_t inipath[MAX_PATH];
 
   (void)hCrearEditImg;
@@ -2168,10 +2168,20 @@ static void LoadSettings(HWND hCrearEditImg, HWND hCrearEditMod, HWND hCrearEdit
   }
 
   g_themePref = GetPrivateProfileIntW(L"Window", L"ThemeDark", 1, inipath) ? 1 : 0;
+
+  int lastTab = GetPrivateProfileIntW(L"Window", L"LastTab", 0, inipath);
+  if (lastTab < 0 || lastTab > 1)
+    lastTab = 0;
+  if (hwndTab)
+    TabCtrl_SetCurSel(hwndTab, lastTab);
+  if (hCrearPanel)
+    ShowWindow(hCrearPanel, lastTab == 0 ? SW_SHOW : SW_HIDE);
+  if (hAplicarPanel)
+    ShowWindow(hAplicarPanel, lastTab == 1 ? SW_SHOW : SW_HIDE);
 }
 
 static void SaveSettings(HWND hCrearEditImg, HWND hCrearEditMod, HWND hCrearEditPPF, HWND hCrearEditDIZ, HWND hCrearEditDesc, HWND hCrearChkUndo, HWND hCrearChkValid, HWND hCrearComboTipo,
-                         HWND hAplicarEditImg, HWND hAplicarEditPPF, HWND hAplicarChkRevert, HWND hAplicarChkSafe) {
+                         HWND hAplicarEditImg, HWND hAplicarEditPPF, HWND hAplicarChkRevert, HWND hAplicarChkSafe, HWND hwndTab) {
   wchar_t inipath[MAX_PATH];
 
   (void)hCrearEditImg;
@@ -2226,6 +2236,15 @@ static void SaveSettings(HWND hCrearEditImg, HWND hCrearEditMod, HWND hCrearEdit
     wchar_t tbuf[4];
     _snwprintf_s(tbuf, 4, _TRUNCATE, L"%d", g_themePref ? 1 : 0);
     WritePrivateProfileStringW(L"Window", L"ThemeDark", tbuf, inipath);
+  }
+
+  if (hwndTab) {
+    int lastTab = TabCtrl_GetCurSel(hwndTab);
+    if (lastTab >= 0 && lastTab <= 1) {
+      wchar_t tabbuf[4];
+      _snwprintf_s(tabbuf, 4, _TRUNCATE, L"%d", lastTab);
+      WritePrivateProfileStringW(L"Window", L"LastTab", tabbuf, inipath);
+    }
   }
 
   {
@@ -3297,8 +3316,13 @@ static DWORD WINAPI CrcCalculationThread(LPVOID lpParam) {
     wchar_t *msg = _wcsdup(L"No se pudo leer el archivo.\r\n");
     SafePostAllocatedString(postTarget, WM_APPEND_OUTPUT, (WPARAM)p->hEdit, msg);
   } else {
-    wchar_t result[256];
-    swprintf(result, 256, L"\r\nCRC32: %08X\r\n", crc);
+    const wchar_t *filename = p->filepath;
+    for (const wchar_t *ch = p->filepath; *ch; ++ch) {
+      if (*ch == L'\\' || *ch == L'/')
+        filename = ch + 1;
+    }
+    wchar_t result[MAX_PATH + 32];
+    swprintf(result, _countof(result), L"- %ls\r\n  CRC32: %08X\r\n", filename, crc);
     SafePostAllocatedString(postTarget, WM_APPEND_OUTPUT, (WPARAM)p->hEdit, _wcsdup(result));
   }
 
@@ -4086,7 +4110,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
           dropKind = 3;
         } else if (hUnder == hAplicarEditImg) {
           hTarget = hUnder;
-          dropKind = 1;
+          dropKind = 4;
         } else if (hUnder == hAplicarEditPPF) {
           hTarget = hUnder;
           dropKind = 2;
@@ -4096,7 +4120,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
           if (DragQueryFileW(hDrop, 0, szPath, MAX_PATH) > 0 && szPath[0]) {
             BOOL ok = FALSE;
             const wchar_t *ext = wcsrchr(szPath, L'.');
-            if (ext) {
+            if (dropKind == 4) {
+              ok = TRUE;
+            } else if (ext) {
               if (dropKind == 1) {
                 ok = (_wcsicmp(ext, L".bin") == 0 || _wcsicmp(ext, L".gi") == 0 || _wcsicmp(ext, L".iso") == 0);
               } else if (dropKind == 2) {
@@ -4488,7 +4514,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     }
 
     LoadSettings(hCrearEditImg, hCrearEditMod, hCrearEditPPF, hCrearEditDIZ, hCrearEditDesc, hCrearChkUndo, hCrearChkValid, hCrearComboTipo, hAplicarEditImg, hAplicarEditPPF, hAplicarChkRevert,
-                 hAplicarChkSafe);
+           hAplicarChkSafe, hwndTab, hCrearPanel, hAplicarPanel);
 
     ApplyCurrentTheme(g_themePref == 1, hwnd, hwndTab, hCrearPanel, hAplicarPanel, hCrearChkUndo, hCrearChkValid, hAplicarChkRevert, hAplicarChkSafe, hMenuBar);
     UpdateButtonThemes(g_isDark, botones, 15);
@@ -5206,16 +5232,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
       HRESULT hrDlg = S_OK;
       const wchar_t *dlgTitle = tw("title_sel_orig_image");
       if (ShowSaveFileDialog_COM(hwnd, filename, MAX_PATH, ofn.lpstrInitialDir, ofn.lpstrFilter, dlgTitle, &hrDlg, OFN_FILEMUSTEXIST)) {
-        const wchar_t *ext = wcsrchr(filename, L'.');
-        BOOL ok = FALSE;
-        if (ext) {
-          ok = (_wcsicmp(ext, L".bin") == 0 || _wcsicmp(ext, L".gi") == 0 || _wcsicmp(ext, L".iso") == 0);
-        }
-        if (ok) {
-          SetWindowTextAndScroll(hTarget, filename);
-        } else {
-          AppendTextToEdit(hAplicarOutput, tw("drag_reject_image"));
-        }
+        SetWindowTextAndScroll(hTarget, filename);
       }
       break;
     }
@@ -5355,7 +5372,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
       }
 
       SaveSettings(hCrearEditImg, hCrearEditMod, hCrearEditPPF, hCrearEditDIZ, hCrearEditDesc, hCrearChkUndo, hCrearChkValid, hCrearComboTipo, hAplicarEditImg, hAplicarEditPPF, hAplicarChkRevert,
-                   hAplicarChkSafe);
+                   hAplicarChkSafe, hwndTab);
       StartProcessCaptureThread(p);
       break;
     }
@@ -5469,7 +5486,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
       wcscpy(p->cmdline, cmdLine);
 
       SaveSettings(hCrearEditImg, hCrearEditMod, hCrearEditPPF, hCrearEditDIZ, hCrearEditDesc, hCrearChkUndo, hCrearChkValid, hCrearComboTipo, hAplicarEditImg, hAplicarEditPPF, hAplicarChkRevert,
-                   hAplicarChkSafe);
+                   hAplicarChkSafe, hwndTab);
 
       StartProcessCaptureThread(p);
       break;
@@ -5630,7 +5647,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     }
 
     SaveSettings(hCrearEditImg, hCrearEditMod, hCrearEditPPF, hCrearEditDIZ, hCrearEditDesc, hCrearChkUndo, hCrearChkValid, hCrearComboTipo, hAplicarEditImg, hAplicarEditPPF, hAplicarChkRevert,
-                 hAplicarChkSafe);
+                 hAplicarChkSafe, hwndTab);
 
     if (hFont) {
       DeleteObject(hFont);

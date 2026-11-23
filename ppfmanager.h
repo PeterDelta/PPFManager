@@ -2,7 +2,7 @@
 #define PPFMANAGER_H
 #include <stddef.h>
 #include <stdio.h>
-#define PPF_VERSION_STR "1.05"
+#define PPF_VERSION_STR "1.06"
 #define PPF_STR_HELPER(x) #x
 #define PPF_STR(x) PPF_STR_HELPER(x)
 #ifdef __cplusplus
